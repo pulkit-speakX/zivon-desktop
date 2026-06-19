@@ -5,12 +5,13 @@ the existing Envoy web UI in a window and adds OS integration. This is an
 **addition** to the platform — it does **not** reimplement the chat, streaming,
 or auth UI.
 
-> **Phase 1 = shell only.** Window + menubar/tray + global hotkey + native
-> notifications + system-browser sign-in. There is **no** local
-> filesystem/terminal/git bridge yet — that lands in Phase 2 behind the
-> risk-tier guardrail layer.
+> **Current slice = shell + guarded desktop bridge.** Window + menubar/tray +
+> global hotkey + native notifications + system-browser sign-in are in place.
+> The local filesystem/terminal bridge now exists behind the Envoy capability
+> layer, the frontend Desktop Access toggle, command allowlists, path grants,
+> macOS `sandbox-exec`, approvals, and audit events.
 
-## What it does (Phase 1)
+## What it does
 
 - Loads the live Envoy web UI from a **single hard-locked endpoint**
   (`http://localhost:3000`) in a native window. This build is an Envoy-only
@@ -23,14 +24,18 @@ or auth UI.
 - **Native notifications**.
 - **Sign-in via the system browser** (Google OAuth is blocked inside embedded
   webviews, so we never do it in-window — see below).
+- **Guarded desktop bridge**: exposes local file list/read/write and terminal
+  execution to Envoy only through the local bridge token written under
+  `~/Library/Application Support/Envoy/desktop-bridge.json`.
 
-## Architecture (Phase 1)
+## Architecture
 
 ```
 src-tauri/            Rust core
   src/main.rs           window, tray, hotkey, notifications, OAuth loopback,
                         keychain token store, localStorage injection
   tauri.conf.json       app config (no windows declared; created in Rust)
+  src/desktop_bridge.rs local HTTP bridge, file grants, terminal sandbox
   capabilities/         capability manifest — grants the splash window a tiny set
                         of permissions; the remote-content window gets NONE
   icons/                app + tray icons (generated from source-1024.png)
@@ -63,7 +68,40 @@ token, and only our local listener — which holds the nonce — accepts it.
   page content (or an injected script) cannot invoke commands or plugins.
 - Only the local `splash` window can call the handful of commands
   (`cmd_start_login`, `cmd_notify_test`).
-- No filesystem/shell/HTTP capability exists in this phase.
+- Filesystem and terminal operations are exposed only through the local desktop
+  bridge. Envoy must send the bridge token, and the Python agent still passes
+  through capability scopes, approvals, and audit.
+- File paths must resolve inside allowed local roots. Current default roots are
+  Desktop, Documents, and Downloads.
+- Terminal commands must pass both an Envoy-side allowlist and the Rust bridge
+  allowlist, then run under macOS `sandbox-exec`.
+
+### Local terminal policy
+
+Allowed command shapes in this slice:
+
+- `pwd`
+- `ls`
+- `ls -la`
+- `git status`
+- `git status --short`
+- `git diff --stat`
+- `git branch --show-current`
+- `cat /private/tmp/envoy-sandbox-demo/allowed/visible.txt`
+- `cat /private/tmp/envoy-sandbox-demo/blocked/secret.txt`
+
+The final `cat` command is intentionally allowlisted so users can visibly test
+the OS sandbox: the command passes Envoy and bridge allowlists, then macOS
+`sandbox-exec` denies reading the blocked demo path and Envoy labels the result
+as `macos_sandbox`.
+
+Blocked examples:
+
+- `ls && cat ~/.ssh/id_rsa`: shell control operators are rejected before the OS
+  sandbox runs.
+- `cat ~/.ssh/id_rsa`: not allowlisted, and `~/.ssh` is a sensitive path.
+- `python`, `node`, `bash`, `sh`, `zsh`: interpreters are not allowlisted.
+- Any terminal `cwd` outside allowed local roots.
 
 ## The one frontend hook (called out explicitly)
 
@@ -110,7 +148,7 @@ setting or env override — change the constant and rebuild to repoint.
 yarn tauri icon src-tauri/icons/source-1024.png
 ```
 
-## Not in this phase
+## Not in this slice
 
-Local bridge / capabilities, guardrails, audit log, session importer, signing /
-notarization / auto-update. Those are Phases 2–5.
+General-purpose shell, arbitrary filesystem access, disconnect/revoke UI,
+signing / notarization / auto-update.
