@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the local shell-chrome window (splash/settings) ONLY. The 'app' window — which loads remote web content (the Envoy web UI) — is deliberately NOT listed here, so remote page content cannot invoke any Tauri command or plugin. Phase 2's local bridge will get its own narrowly-scoped, origin-checked capability; this is the security boundary.",
+  "windows": ["splash"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-set-focus",
+    "opener:default",
+    "notification:default",
+    "global-shortcut:default"
+  ]
+}

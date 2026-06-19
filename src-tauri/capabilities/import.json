@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "import",
+  "description": "Permissions for the local 'Import Claude sessions' window. Grants core IPC + event listening so it can call the claude_* import commands and receive progress events. No filesystem/shell/http capability is exposed to the webview — the parsing and the authenticated HTTP call happen in trusted Rust, not in page content.",
+  "windows": ["import"],
+  "permissions": ["core:default"]
+}

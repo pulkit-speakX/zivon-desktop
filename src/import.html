@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Import Claude Sessions · Envoy</title>
+    <link rel="stylesheet" href="theme.css" />
+    <style>
+      html, body { height: 100%; }
+      body { -webkit-user-select: none; user-select: none; }
+      .wrap { display: flex; flex-direction: column; height: 100vh; }
+      header { padding: 20px 22px 12px; }
+      .title-row { display: flex; align-items: center; gap: 11px; }
+      .mark { width: 30px; height: 30px; color: var(--clay); }
+      .mark svg { width: 100%; height: 100%; }
+      h1 { font-size: 19px; margin: 0; }
+      .sub { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+      .toolbar {
+        display: flex; align-items: center; gap: 14px; padding: 8px 22px 12px; flex-wrap: wrap;
+      }
+      .toolbar .grow { flex: 1; }
+      input[type="search"] {
+        background: var(--panel); border: 1px solid var(--border); color: var(--text);
+        border-radius: 9px; padding: 9px 11px; font-size: 13px; width: 100%;
+      }
+      .count { color: var(--muted); font-size: 13px; white-space: nowrap; }
+      .list { flex: 1; overflow: auto; margin: 0 22px; border: 1px solid var(--border); border-radius: 12px; }
+      .row { display: flex; gap: 12px; padding: 11px 13px; border-bottom: 1px solid var(--border); align-items: flex-start; }
+      .row:last-child { border-bottom: 0; }
+      .row:hover { background: var(--panel); }
+      .row input[type="checkbox"] { margin-top: 3px; width: 16px; height: 16px; accent-color: var(--clay); }
+      .badge {
+        font-size: 11px; color: var(--muted); background: var(--panel-2);
+        border-radius: 20px; padding: 2px 9px; white-space: nowrap;
+      }
+      .meta { flex: 1; min-width: 0; }
+      .proj { font-weight: 600; font-size: 13px; }
+      .date { color: var(--muted); font-size: 11px; margin-left: 8px; font-weight: 400; }
+      .prev { color: var(--muted); font-size: 12px; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .log { margin: 12px 22px 0; font-size: 12.5px; max-height: 26vh; overflow: auto; }
+      .log .item { padding: 6px 0; border-bottom: 1px solid var(--border); }
+      .log a { color: var(--clay-hover); }
+      footer {
+        padding: 14px 22px; border-top: 1px solid var(--border);
+        display: flex; align-items: center; gap: 16px; background: var(--bg);
+      }
+      .bar { flex: 1; height: 8px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
+      .bar > div { height: 100%; width: 0; background: var(--clay); transition: width 0.2s; }
+      .empty { padding: 26px; color: var(--muted); text-align: center; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div class="title-row">
+          <span class="mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 1.5c.32 0 .6.2.7.5l1.86 5.27 5.27 1.86c.3.1.5.38.5.7s-.2.6-.5.7l-5.27 1.86-1.86 5.27c-.1.3-.38.5-.7.5s-.6-.2-.7-.5l-1.86-5.27-5.27-1.86c-.3-.1-.5-.38-.5-.7s.2-.6.5-.7l5.27-1.86 1.86-5.27c.1-.3.38-.5.7-.5z"/></svg>
+          </span>
+          <h1>Import Claude sessions</h1>
+        </div>
+        <p class="sub">Bring your local Claude Code sessions into Envoy and continue them. Imported into your Envoy.</p>
+      </header>
+
+      <div class="toolbar">
+        <button class="link" id="selAll">Select all</button>
+        <button class="link" id="selNone">Select none</button>
+        <span class="grow"><input type="search" id="filter" placeholder="Filter by project or text…" /></span>
+        <span class="count" id="count"></span>
+      </div>
+
+      <div class="list" id="list"><div class="empty">Scanning ~/.claude…</div></div>
+
+      <div class="log" id="log"></div>
+
+      <footer>
+        <div class="bar"><div id="barFill"></div></div>
+        <span class="count" id="progressText"></span>
+        <button class="btn" id="importBtn" disabled>Import selected</button>
+      </footer>
+    </div>
+
+    <script>
+      const { invoke } = window.__TAURI__.core;
+      const { listen } = window.__TAURI__.event;
+      const $ = (id) => document.getElementById(id);
+
+      let sessions = [];
+      const sel = new Set();
+      let importing = false;
+
+      const escapeHtml = (s) => (s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+      const shortProj = (p) => {
+        const parts = (p || "").split("/").filter(Boolean);
+        return parts.length > 2 ? ".../" + parts.slice(-2).join("/") : p || "(unknown)";
+      };
+      const fmtDate = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return iso || ""; } };
+
+      function refreshCount() {
+        $("count").textContent = `${sel.size} of ${sessions.length} selected`;
+        $("importBtn").disabled = sel.size === 0 || importing;
+      }
+
+      function renderList() {
+        const q = $("filter").value.trim().toLowerCase();
+        const list = $("list");
+        const shown = sessions.filter((s) => !q || (s.project + " " + s.preview).toLowerCase().includes(q));
+        if (!shown.length) { list.innerHTML = '<div class="empty">No sessions match.</div>'; return; }
+        list.innerHTML = "";
+        for (const s of shown) {
+          const row = document.createElement("label");
+          row.className = "row";
+          row.innerHTML = `
+            <input type="checkbox" data-id="${s.session_id}" ${sel.has(s.session_id) ? "checked" : ""} />
+            <span class="badge">${s.turn_count} turns</span>
+            <span class="meta">
+              <span class="proj">${escapeHtml(shortProj(s.project))}<span class="date">${fmtDate(s.last_at)}</span></span>
+              <div class="prev">${escapeHtml(s.preview)}</div>
+            </span>`;
+          row.querySelector("input").addEventListener("change", (e) => {
+            e.target.checked ? sel.add(s.session_id) : sel.delete(s.session_id);
+            refreshCount();
+          });
+          list.appendChild(row);
+        }
+      }
+
+      async function load() {
+        try {
+          sessions = await invoke("claude_list_sessions");
+          if (!sessions.length) { $("list").innerHTML = '<div class="empty">No Claude Code sessions found under ~/.claude.</div>'; return; }
+          sessions.forEach((s) => sel.add(s.session_id)); // default: all selected
+          renderList();
+          refreshCount();
+        } catch (e) {
+          $("list").innerHTML = `<div class="empty err">${escapeHtml(String(e))}</div>`;
+        }
+      }
+      load();
+
+      $("selAll").addEventListener("click", () => { sessions.forEach((s) => sel.add(s.session_id)); renderList(); refreshCount(); });
+      $("selNone").addEventListener("click", () => { sel.clear(); renderList(); refreshCount(); });
+      $("filter").addEventListener("input", renderList);
+
+      // progress events from Rust
+      let totalToImport = 0, doneCount = 0;
+      listen("import://progress", (event) => {
+        const ev = event.payload;
+        const log = $("log");
+        if (ev.type === "session_start") {
+          const d = document.createElement("div");
+          d.className = "item"; d.id = "s-" + ev.session_id;
+          d.innerHTML = `<span class="spinner"></span> Importing <b>${escapeHtml(shortProj(ev.project))}</b> (${ev.turns} turns)…`;
+          log.prepend(d);
+          $("progressText").textContent = `Session ${ev.index} of ${ev.total}`;
+        } else if (ev.type === "session_done") {
+          doneCount++;
+          const d = $("s-" + ev.session_id);
+          if (d) d.innerHTML = `<span class="ok">✓</span> ${escapeHtml(ev.title)} — ${ev.turns_written} turns · <button class="link" data-url="${ev.url}">Open in Envoy →</button>`;
+          $("barFill").style.width = Math.round((doneCount / totalToImport) * 100) + "%";
+        } else if (ev.type === "session_error") {
+          const d = $("s-" + ev.session_id) || log;
+          d.innerHTML = `<span class="err">✗ ${escapeHtml(ev.message)}</span>`;
+          doneCount++;
+        } else if (ev.type === "all_done") {
+          importing = false;
+          $("progressText").textContent = "Done.";
+          refreshCount();
+        }
+      });
+
+      // delegated click for "Open in Envoy"
+      $("log").addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-url]");
+        if (btn) invoke("open_session_in_app", { url: btn.getAttribute("data-url") });
+      });
+
+      $("importBtn").addEventListener("click", async () => {
+        const ids = [...sel];
+        if (!ids.length || importing) return;
+        importing = true; doneCount = 0; totalToImport = ids.length;
+        $("log").innerHTML = ""; $("barFill").style.width = "0";
+        refreshCount();
+        try {
+          await invoke("claude_import", { sessionIds: ids });
+        } catch (e) {
+          importing = false;
+          const d = document.createElement("div");
+          d.className = "item err"; d.textContent = "Import failed: " + e;
+          $("log").prepend(d);
+          refreshCount();
+        }
+      });
+    </script>
+  </body>
+</html>

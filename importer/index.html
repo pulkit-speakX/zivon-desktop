@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Envoy · Import Claude Sessions</title>
+    <style>
+      :root {
+        --bg: #0b0b0f; --card: #15151c; --card2: #1c1c25; --border: #2a2a34;
+        --text: #f4f4f5; --muted: #9a9aa5; --accent: #e855a0;
+        --grad: linear-gradient(135deg, #f97316 0%, #e855a0 50%, #8b5cf6 100%);
+        --ok: #34d399; --err: #f87171;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; background: var(--bg); color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 14px;
+      }
+      .wrap { max-width: 920px; margin: 0 auto; padding: 28px 20px 80px; }
+      header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+      .mark { width: 36px; height: 36px; border-radius: 9px; background: var(--grad);
+        display: flex; align-items: center; justify-content: center; font-weight: 800; }
+      h1 { font-size: 20px; margin: 0; }
+      .sub { color: var(--muted); margin: 0 0 22px; }
+      .panel { background: var(--card); border: 1px solid var(--border);
+        border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+      label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+      select, input[type=search] {
+        width: 100%; background: var(--card2); border: 1px solid var(--border);
+        color: var(--text); border-radius: 9px; padding: 10px; font-size: 13px;
+      }
+      .targets { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      .toolbar { display: flex; align-items: center; gap: 14px; margin: 4px 0 12px; flex-wrap: wrap; }
+      .toolbar .grow { flex: 1; }
+      .link { color: var(--accent); cursor: pointer; font-size: 13px; background: none; border: 0; }
+      .count { color: var(--muted); font-size: 13px; }
+      .list { max-height: 46vh; overflow: auto; border: 1px solid var(--border); border-radius: 12px; }
+      .row { display: flex; gap: 12px; padding: 11px 13px; border-bottom: 1px solid var(--border); align-items: flex-start; }
+      .row:last-child { border-bottom: 0; }
+      .row:hover { background: var(--card2); }
+      .row input[type=checkbox] { margin-top: 3px; width: 16px; height: 16px; accent-color: var(--accent); }
+      .badge { font-size: 11px; color: var(--muted); background: var(--card2);
+        border: 1px solid var(--border); border-radius: 20px; padding: 2px 8px; white-space: nowrap; }
+      .meta { flex: 1; min-width: 0; }
+      .proj { font-weight: 600; font-size: 13px; }
+      .date { color: var(--muted); font-size: 11px; margin-left: 8px; font-weight: 400; }
+      .prev { color: var(--muted); font-size: 12px; margin-top: 3px; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; }
+      .footer { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(11,11,15,.92);
+        border-top: 1px solid var(--border); padding: 14px 20px; backdrop-filter: blur(8px); }
+      .footer .inner { max-width: 920px; margin: 0 auto; display: flex; align-items: center; gap: 16px; }
+      .btn { border: 0; border-radius: 11px; padding: 12px 22px; font-weight: 700; font-size: 14px;
+        color: #fff; background: var(--grad); cursor: pointer; }
+      .btn[disabled] { opacity: .45; cursor: default; }
+      .bar { flex: 1; height: 8px; background: var(--card2); border-radius: 5px; overflow: hidden; }
+      .bar > div { height: 100%; width: 0; background: var(--grad); transition: width .2s; }
+      .log { margin-top: 14px; font-size: 12.5px; }
+      .log .item { padding: 6px 0; border-bottom: 1px solid var(--border); }
+      .log a { color: var(--accent); }
+      .ok { color: var(--ok); } .er { color: var(--err); }
+      .hidden { display: none; }
+      .notice { color: var(--err); font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div class="mark">E</div>
+        <div>
+          <h1>Import Claude sessions into Envoy</h1>
+        </div>
+      </header>
+      <p class="sub">Pick a target, choose which Claude sessions to bring over, and continue them in Envoy.</p>
+
+      <div class="panel">
+        <div class="targets">
+          <div>
+            <label>Organization</label>
+            <select id="org"></select>
+          </div>
+          <div>
+            <label>Envoy (target)</label>
+            <select id="envoy"></select>
+          </div>
+        </div>
+        <div id="targetErr" class="notice" style="margin-top:10px;"></div>
+      </div>
+
+      <div class="panel">
+        <div class="toolbar">
+          <button class="link" id="selAll">Select all</button>
+          <button class="link" id="selNone">Select none</button>
+          <input class="grow" type="search" id="filter" placeholder="Filter by project or text…" />
+          <span class="count" id="count"></span>
+        </div>
+        <div class="list" id="list"><div style="padding:18px;color:var(--muted)">Loading sessions…</div></div>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div class="inner">
+        <div class="bar"><div id="barFill"></div></div>
+        <span class="count" id="progressText"></span>
+        <button class="btn" id="importBtn" disabled>Import selected</button>
+      </div>
+    </div>
+
+    <script>
+      const WEB_BASE = "http://localhost:3000";
+      let sessions = [];
+      let orgs = [];
+      const sel = new Set();
+
+      const $ = (id) => document.getElementById(id);
+
+      function fmtDate(iso) {
+        if (!iso) return "";
+        try { return new Date(iso).toLocaleString(); } catch { return iso; }
+      }
+
+      function refreshCount() {
+        $("count").textContent = `${sel.size} of ${sessions.length} selected`;
+        $("importBtn").disabled = sel.size === 0 || !$("envoy").value;
+      }
+
+      function renderList() {
+        const q = $("filter").value.trim().toLowerCase();
+        const list = $("list");
+        list.innerHTML = "";
+        const shown = sessions.filter(
+          (s) => !q || (s.project + " " + s.preview).toLowerCase().includes(q)
+        );
+        if (!shown.length) {
+          list.innerHTML = '<div style="padding:18px;color:var(--muted)">No sessions match.</div>';
+          return;
+        }
+        for (const s of shown) {
+          const row = document.createElement("label");
+          row.className = "row";
+          const checked = sel.has(s.session_id) ? "checked" : "";
+          row.innerHTML = `
+            <input type="checkbox" data-id="${s.session_id}" ${checked} />
+            <span class="badge">${s.turn_count} turns</span>
+            <span class="meta">
+              <span class="proj">${escapeHtml(shortProj(s.project))}<span class="date">${fmtDate(s.last_at)}</span></span>
+              <div class="prev">${escapeHtml(s.preview)}</div>
+            </span>`;
+          row.querySelector("input").addEventListener("change", (e) => {
+            if (e.target.checked) sel.add(s.session_id);
+            else sel.delete(s.session_id);
+            refreshCount();
+          });
+          list.appendChild(row);
+        }
+      }
+
+      function shortProj(p) {
+        const parts = (p || "").split("/").filter(Boolean);
+        return parts.length > 2 ? ".../" + parts.slice(-2).join("/") : p;
+      }
+      function escapeHtml(s) {
+        return (s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+      }
+
+      // --- load sessions ---
+      fetch("/api/sessions").then((r) => r.json()).then((d) => {
+        if (d.error) { $("list").innerHTML = `<div style="padding:18px" class="notice">${d.error}</div>`; return; }
+        sessions = d.sessions;
+        sessions.forEach((s) => sel.add(s.session_id)); // default: all selected
+        renderList();
+        refreshCount();
+      });
+
+      // --- load targets ---
+      fetch("/api/targets").then((r) => r.json()).then((d) => {
+        if (d.error) { $("targetErr").textContent = "Could not reach Mongo: " + d.error; return; }
+        orgs = d.orgs || [];
+        $("org").innerHTML = orgs.map((o) => `<option value="${o.slug}">${o.slug}</option>`).join("");
+        populateEnvoys();
+      }).catch((e) => ($("targetErr").textContent = String(e)));
+
+      function populateEnvoys() {
+        const org = orgs.find((o) => o.slug === $("org").value);
+        const envoys = (org && org.envoys) || [];
+        $("envoy").innerHTML = envoys
+          .map((e) => `<option value="${e.envoy_id}">${escapeHtml(e.name)}${e.owner_email ? " — " + escapeHtml(e.owner_email) : ""}</option>`)
+          .join("");
+        if (!envoys.length) $("envoy").innerHTML = '<option value="">(no envoys in this org)</option>';
+        refreshCount();
+      }
+      $("org").addEventListener("change", populateEnvoys);
+      $("envoy").addEventListener("change", refreshCount);
+
+      // --- toolbar ---
+      $("selAll").addEventListener("click", () => { sessions.forEach((s) => sel.add(s.session_id)); renderList(); refreshCount(); });
+      $("selNone").addEventListener("click", () => { sel.clear(); renderList(); refreshCount(); });
+      $("filter").addEventListener("input", renderList);
+
+      // --- import (streaming progress) ---
+      $("importBtn").addEventListener("click", async () => {
+        const org = $("org").value, envoy_id = $("envoy").value;
+        const ids = [...sel];
+        if (!org || !envoy_id || !ids.length) return;
+        $("importBtn").disabled = true;
+        $("log").innerHTML = "";
+        const log = $("log");
+        let doneSessions = 0;
+
+        const res = await fetch("/api/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ org, envoy_id, session_ids: ids }),
+        });
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line) continue;
+            handleEvent(JSON.parse(line), log, () => ++doneSessions, ids.length);
+          }
+        }
+        $("progressText").textContent = "Done.";
+        $("importBtn").disabled = false;
+      });
+
+      function handleEvent(ev, log, incDone, totalSessions) {
+        if (ev.type === "session_start") {
+          const d = document.createElement("div");
+          d.className = "item";
+          d.id = "s-" + ev.session_id;
+          d.innerHTML = `Importing <b>${escapeHtml(shortProj(ev.project))}</b> — <span class="st">0/${ev.turns} turns</span>`;
+          log.prepend(d);
+          $("progressText").textContent = `Session ${ev.index} of ${ev.total}`;
+        } else if (ev.type === "turn") {
+          const el = document.querySelector("#s-" + ev.session_id + " .st");
+          if (el) el.textContent = `${ev.done}/${ev.total} turns`;
+        } else if (ev.type === "session_done") {
+          const d = document.getElementById("s-" + ev.session_id);
+          const done = incDone();
+          const full = WEB_BASE + ev.url;
+          if (d) d.innerHTML = `<span class="ok">✓</span> ${escapeHtml(ev.title)} — ${ev.turns_written} turns · <a href="${full}" target="_blank">Open in Envoy ↗</a>`;
+          $("barFill").style.width = Math.round((done / totalSessions) * 100) + "%";
+        } else if (ev.type === "session_error") {
+          const d = document.getElementById("s-" + ev.session_id) || log;
+          d.innerHTML = `<span class="er">✗ ${escapeHtml(ev.message)}</span>`;
+        } else if (ev.type === "error") {
+          const d = document.createElement("div");
+          d.className = "item er";
+          d.textContent = "Error: " + ev.message;
+          log.prepend(d);
+        } else if (ev.type === "all_done") {
+          $("barFill").style.width = "100%";
+        }
+      }
+    </script>
+  </body>
+</html>
