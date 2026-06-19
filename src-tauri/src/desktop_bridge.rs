@@ -534,29 +534,32 @@ fn sandbox_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn sandbox_profile(roots: &[PathBuf]) -> String {
-    let mut read_paths = vec![
-        "/bin".to_string(),
-        "/sbin".to_string(),
-        "/usr".to_string(),
-        "/System".to_string(),
-        "/Library".to_string(),
-        "/private/etc".to_string(),
-        "/etc".to_string(),
-        "/dev/null".to_string(),
-        "/dev/urandom".to_string(),
-    ];
-    read_paths.extend(roots.iter().map(|root| root.to_string_lossy().to_string()));
+fn sensitive_sandbox_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        for name in [".ssh", ".aws", ".gnupg", ".kube"] {
+            paths.push(home.join(name).to_string_lossy().to_string());
+        }
+        paths.push(home.join("Library").join("Keychains").to_string_lossy().to_string());
+    }
+    paths
+}
 
+fn sandbox_profile(roots: &[PathBuf]) -> String {
     let mut write_paths = vec!["/tmp".to_string(), "/private/tmp".to_string()];
     let temp_dir = std::env::temp_dir().to_string_lossy().to_string();
     if !write_paths.iter().any(|path| path == &temp_dir) {
         write_paths.push(temp_dir);
     }
 
-    let read_rules = read_paths
+    let root_notes = roots
         .iter()
-        .map(|path| format!("  (subpath \"{}\")", sandbox_string(path)))
+        .map(|path| format!(";; approved-root \"{}\"", sandbox_string(&path.to_string_lossy())))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sensitive_denies = sensitive_sandbox_paths()
+        .iter()
+        .map(|path| format!("(deny file-read* (subpath \"{}\"))", sandbox_string(path)))
         .collect::<Vec<_>>()
         .join("\n");
     let write_rules = write_paths
@@ -567,10 +570,13 @@ fn sandbox_profile(roots: &[PathBuf]) -> String {
 
     format!(
         "(version 1)\n\
+         {root_notes}\n\
          (deny default)\n\
          (allow process*)\n\
-         (allow file-read-metadata)\n\
-         (allow file-read*\n{read_rules})\n\
+         (allow sysctl-read)\n\
+         (allow mach-lookup)\n\
+         (allow file-read*)\n\
+         {sensitive_denies}\n\
          (allow file-write*\n{write_rules})\n\
          (deny network*)\n"
     )
@@ -1051,14 +1057,46 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_profile_denies_default_and_network_while_allowing_roots() {
+    fn sandbox_profile_denies_sensitive_paths_and_network_while_recording_roots() {
         let root = PathBuf::from("/Users/example/Documents");
 
         let profile = sandbox_profile(&[root]);
 
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(deny network*)"));
-        assert!(profile.contains("(subpath \"/Users/example/Documents\")"));
+        assert!(profile.contains("approved-root \"/Users/example/Documents\""));
+        assert!(profile.contains("(allow sysctl-read)"));
+        assert!(profile.contains("(allow mach-lookup)"));
+        if let Some(home) = dirs::home_dir() {
+            assert!(profile.contains(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                home.join(".ssh").to_string_lossy()
+            )));
+        }
+    }
+
+    #[test]
+    fn sandbox_profile_runs_pwd_when_sandbox_exec_is_available() {
+        if !Path::new(SANDBOX_EXEC_PATH).is_file() {
+            return;
+        }
+
+        let root = unique_temp_dir("terminal-sandbox-smoke");
+        fs::create_dir_all(&root).expect("root dir");
+        let cwd = root.canonicalize().expect("canonical root");
+        let profile = sandbox_profile(std::slice::from_ref(&cwd));
+        let argv = vec!["pwd".to_string()];
+
+        let (exit_code, stdout, stderr) = run_sandboxed_process(&argv, &cwd, &profile)
+            .expect("sandboxed pwd should run");
+        if stderr.contains("sandbox_apply: Operation not permitted") {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        assert_eq!(exit_code, 0, "{stderr}");
+        assert!(stdout.contains(&cwd.to_string_lossy().to_string()));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
