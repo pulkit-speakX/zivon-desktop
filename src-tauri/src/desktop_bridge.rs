@@ -13,6 +13,9 @@ const BRIDGE_TOKEN_HEADER: &str = "X-Envoy-Desktop-Bridge-Token";
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 const TERMINAL_TIMEOUT_SECONDS: u64 = 10;
+const SANDBOX_DEMO_ALLOWED_FILE: &str = "/private/tmp/envoy-sandbox-demo/allowed/visible.txt";
+const SANDBOX_DEMO_BLOCKED_ROOT: &str = "/private/tmp/envoy-sandbox-demo/blocked";
+const SANDBOX_DEMO_BLOCKED_FILE: &str = "/private/tmp/envoy-sandbox-demo/blocked/secret.txt";
 
 #[derive(Clone)]
 pub struct DesktopBridgeState {
@@ -86,6 +89,7 @@ struct CommandResult {
     exit_code: i32,
     stdout: String,
     stderr: String,
+    blocked_by: Option<String>,
 }
 
 impl Default for DesktopBridgeState {
@@ -507,6 +511,12 @@ fn validate_terminal_command(command: &str) -> Result<Vec<String>, String> {
         "git status --short" => vec!["git", "status", "--short"],
         "git diff --stat" => vec!["git", "diff", "--stat"],
         "git branch --show-current" => vec!["git", "branch", "--show-current"],
+        command if command == format!("cat {SANDBOX_DEMO_ALLOWED_FILE}") => {
+            vec!["cat", SANDBOX_DEMO_ALLOWED_FILE]
+        }
+        command if command == format!("cat {SANDBOX_DEMO_BLOCKED_FILE}") => {
+            vec!["cat", SANDBOX_DEMO_BLOCKED_FILE]
+        }
         _ => return Err("command is not allowed by the local terminal policy".to_string()),
     };
 
@@ -542,6 +552,7 @@ fn sensitive_sandbox_paths() -> Vec<String> {
         }
         paths.push(home.join("Library").join("Keychains").to_string_lossy().to_string());
     }
+    paths.push(SANDBOX_DEMO_BLOCKED_ROOT.to_string());
     paths
 }
 
@@ -601,6 +612,17 @@ fn limited_output(bytes: &[u8]) -> String {
     let mut truncated = text.chars().take(MAX_COMMAND_OUTPUT_BYTES).collect::<String>();
     truncated.push_str("\n[output truncated]");
     truncated
+}
+
+fn classify_terminal_block(exit_code: i32, stderr: &str) -> Option<String> {
+    if exit_code != 0
+        && (stderr.contains("Operation not permitted")
+            || stderr.contains("sandbox")
+            || stderr.contains("deny("))
+    {
+        return Some("macos_sandbox".to_string());
+    }
+    None
 }
 
 fn run_sandboxed_process(argv: &[String], cwd: &Path, profile: &str) -> Result<(i32, String, String), String> {
@@ -832,6 +854,7 @@ fn run_terminal_command(state: &DesktopBridgeState, payload: RunCommandRequest) 
     let cwd = resolve_terminal_cwd(&roots, working_folder.as_deref(), payload.cwd.as_deref())?;
     let profile = sandbox_profile(&canonical_roots(&roots));
     let (exit_code, stdout, stderr) = run_sandboxed_process(&argv, &cwd, &profile)?;
+    let blocked_by = classify_terminal_block(exit_code, &stderr);
 
     Ok(CommandResult {
         command: payload.command.trim().to_string(),
@@ -839,6 +862,7 @@ fn run_terminal_command(state: &DesktopBridgeState, payload: RunCommandRequest) 
         exit_code,
         stdout,
         stderr,
+        blocked_by,
     })
 }
 
@@ -1026,6 +1050,17 @@ mod tests {
     }
 
     #[test]
+    fn terminal_policy_allows_exact_sandbox_demo_cat_commands() {
+        let allowed = validate_terminal_command(&format!("cat {SANDBOX_DEMO_ALLOWED_FILE}"))
+            .expect("demo visible file cat should pass");
+        let blocked = validate_terminal_command(&format!("cat {SANDBOX_DEMO_BLOCKED_FILE}"))
+            .expect("demo blocked file cat should pass so sandbox can deny it");
+
+        assert_eq!(allowed, vec!["cat".to_string(), SANDBOX_DEMO_ALLOWED_FILE.to_string()]);
+        assert_eq!(blocked, vec!["cat".to_string(), SANDBOX_DEMO_BLOCKED_FILE.to_string()]);
+    }
+
+    #[test]
     fn terminal_policy_blocks_shell_control() {
         let err = validate_terminal_command("git status && cat ~/.ssh/id_rsa")
             .expect_err("shell control operators must be rejected");
@@ -1073,6 +1108,20 @@ mod tests {
                 home.join(".ssh").to_string_lossy()
             )));
         }
+        assert!(profile.contains(&format!(
+            "(deny file-read* (subpath \"{}\"))",
+            SANDBOX_DEMO_BLOCKED_ROOT
+        )));
+    }
+
+    #[test]
+    fn sandbox_denial_is_tagged_for_visible_result() {
+        let blocked_by = classify_terminal_block(
+            1,
+            "cat: /private/tmp/envoy-sandbox-demo/blocked/secret.txt: Operation not permitted",
+        );
+
+        assert_eq!(blocked_by, Some("macos_sandbox".to_string()));
     }
 
     #[test]
@@ -1097,6 +1146,32 @@ mod tests {
         assert_eq!(exit_code, 0, "{stderr}");
         assert!(stdout.contains(&cwd.to_string_lossy().to_string()));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sandbox_profile_blocks_demo_secret_when_sandbox_exec_is_available() {
+        if !Path::new(SANDBOX_EXEC_PATH).is_file() {
+            return;
+        }
+
+        let cwd = unique_temp_dir("terminal-sandbox-demo-cwd");
+        fs::create_dir_all(&cwd).expect("cwd dir");
+        fs::create_dir_all(SANDBOX_DEMO_BLOCKED_ROOT).expect("blocked demo dir");
+        fs::write(SANDBOX_DEMO_BLOCKED_FILE, "fake-secret").expect("blocked demo file");
+        let cwd = cwd.canonicalize().expect("canonical cwd");
+        let profile = sandbox_profile(std::slice::from_ref(&cwd));
+        let argv = vec!["cat".to_string(), SANDBOX_DEMO_BLOCKED_FILE.to_string()];
+
+        let (exit_code, _stdout, stderr) = run_sandboxed_process(&argv, &cwd, &profile)
+            .expect("sandboxed cat should run and be denied by policy");
+        if stderr.contains("sandbox_apply: Operation not permitted") {
+            let _ = fs::remove_dir_all(cwd);
+            return;
+        }
+
+        assert_ne!(exit_code, 0);
+        assert_eq!(classify_terminal_block(exit_code, &stderr), Some("macos_sandbox".to_string()));
+        let _ = fs::remove_dir_all(cwd);
     }
 
     #[test]
