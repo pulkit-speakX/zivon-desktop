@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -13,6 +14,8 @@ const BRIDGE_TOKEN_HEADER: &str = "X-Envoy-Desktop-Bridge-Token";
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 const TERMINAL_TIMEOUT_SECONDS: u64 = 10;
+const PATH_DISCOVERY_MAX_DEPTH: usize = 5;
+const PATH_DISCOVERY_MAX_VISITS: usize = 4_000;
 const SANDBOX_DEMO_ALLOWED_FILE: &str = "/private/tmp/envoy-sandbox-demo/allowed/visible.txt";
 const SANDBOX_DEMO_BLOCKED_ROOT: &str = "/private/tmp/envoy-sandbox-demo/blocked";
 const SANDBOX_DEMO_BLOCKED_FILE: &str = "/private/tmp/envoy-sandbox-demo/blocked/secret.txt";
@@ -271,6 +274,122 @@ fn clean_relative_path(rel: &Path) -> Result<PathBuf, String> {
     Ok(clean)
 }
 
+fn lookup_path_from_request(requested: &str) -> Result<Option<PathBuf>, String> {
+    let trimmed = requested.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return Ok(None);
+    }
+
+    let expanded = expand_home_path(trimmed);
+    let rel = if expanded.is_absolute() {
+        let Some(home) = dirs::home_dir() else {
+            return Ok(None);
+        };
+        match expanded.strip_prefix(home) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => return Ok(None),
+        }
+    } else {
+        expanded
+    };
+    if rel.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    clean_relative_path(&rel).map(Some)
+}
+
+fn skip_discovery_dir(path: &Path) -> bool {
+    if has_sensitive_component(path) {
+        return true;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with('.')
+        || matches!(
+            name,
+            "node_modules" | "target" | "dist" | "build" | ".next" | "__pycache__"
+        )
+}
+
+fn discover_existing_path(roots: &[PathBuf], requested: &str) -> Result<Option<PathBuf>, String> {
+    let Some(lookup) = lookup_path_from_request(requested)? else {
+        return Ok(None);
+    };
+    let parts = lookup.components().collect::<Vec<_>>();
+    let Some(Component::Normal(first_part)) = parts.first() else {
+        return Ok(None);
+    };
+    let remainder = parts
+        .iter()
+        .skip(1)
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let roots = canonical_roots(roots);
+    let mut matches = Vec::new();
+    for root in &roots {
+        let direct = root.join(&lookup);
+        if direct.exists() {
+            matches.push(
+                direct
+                    .canonicalize()
+                    .map_err(|e| format!("could not resolve discovered path: {e}"))?,
+            );
+        }
+    }
+
+    let mut queue = VecDeque::new();
+    for root in roots {
+        queue.push_back((root, 0usize));
+    }
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        if visited >= PATH_DISCOVERY_MAX_VISITS || depth >= PATH_DISCOVERY_MAX_DEPTH {
+            continue;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > PATH_DISCOVERY_MAX_VISITS {
+                break;
+            }
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if entry.file_name() == *first_part {
+                let mut candidate = path.clone();
+                for part in &remainder {
+                    candidate.push(part);
+                }
+                if candidate.exists() {
+                    matches.push(candidate.canonicalize().map_err(|e| {
+                        format!("could not resolve discovered path: {e}")
+                    })?);
+                }
+            }
+            if file_type.is_dir() && !skip_discovery_dir(&path) {
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
+
+    matches = dedupe_paths(matches);
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => Err("multiple local paths match; provide a more specific path".to_string()),
+    }
+}
+
 fn candidate_path(requested: &str, working_folder: Option<&Path>) -> Result<PathBuf, String> {
     let trimmed = requested.trim();
     if trimmed.is_empty() || trimmed == "." {
@@ -363,13 +482,31 @@ fn resolve_allowed_path(
         return Err("no local access roots are available".to_string());
     }
 
-    let candidate = candidate_path(requested, working_folder)?;
+    let candidate = match candidate_path(requested, working_folder) {
+        Ok(candidate) => candidate,
+        Err(err) if must_exist && err.contains("working folder") => {
+            if let Some(discovered) = discover_existing_path(&roots, requested)? {
+                discovered
+            } else {
+                return Err(err);
+            }
+        }
+        Err(err) => return Err(err),
+    };
     ensure_not_sensitive(&candidate)?;
 
     let resolved = if must_exist || candidate.exists() {
-        candidate
-            .canonicalize()
-            .map_err(|e| format!("could not resolve local path: {e}"))?
+        match candidate.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(err) if must_exist => {
+                if let Some(discovered) = discover_existing_path(&roots, requested)? {
+                    discovered
+                } else {
+                    return Err(format!("could not resolve local path: {err}"));
+                }
+            }
+            Err(err) => return Err(format!("could not resolve local path: {err}")),
+        }
     } else {
         ensure_inside_allowed_roots(&candidate, &roots)?;
         let existing_parent = nearest_existing_ancestor(&candidate)
@@ -1006,6 +1143,47 @@ mod tests {
     }
 
     #[test]
+    fn discovers_bare_repo_name_under_allowed_roots() {
+        let root = unique_temp_dir("allowed-root");
+        let repo = root.join("speakx").join("zivon-v2").join("zivon-frontend");
+        fs::create_dir_all(&repo).expect("repo dir");
+
+        let resolved = resolve_allowed_path(&[root.clone()], None, "zivon-frontend", true)
+            .expect("bare repo name should resolve inside allowed roots");
+
+        assert_eq!(resolved, repo.canonicalize().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_home_relative_repo_name_under_allowed_roots() {
+        let root = unique_temp_dir("allowed-root");
+        let repo = root.join("speakx").join("zivon-v2").join("zivon-frontend");
+        fs::create_dir_all(&repo).expect("repo dir");
+
+        let resolved = resolve_allowed_path(&[root.clone()], None, "~/zivon-frontend", true)
+            .expect("home-relative repo name should fall back to allowed root discovery");
+
+        assert_eq!(resolved, repo.canonicalize().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_file_inside_repo_under_allowed_roots() {
+        let root = unique_temp_dir("allowed-root");
+        let repo = root.join("speakx").join("zivon-v2").join("zivon-frontend");
+        fs::create_dir_all(&repo).expect("repo dir");
+        let package_json = repo.join("package.json");
+        fs::write(&package_json, "{}").expect("package file");
+
+        let resolved = resolve_allowed_path(&[root.clone()], None, "zivon-frontend/package.json", true)
+            .expect("repo-relative file should resolve inside discovered repo");
+
+        assert_eq!(resolved, package_json.canonicalize().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn lists_immediate_files_with_counts() {
         let root = unique_temp_dir("allowed-root");
         fs::create_dir_all(root.join("folder")).expect("folder");
@@ -1089,6 +1267,19 @@ mod tests {
         assert!(err.contains("outside allowed local access roots"));
         let _ = fs::remove_dir_all(allowed);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn terminal_cwd_discovers_bare_repo_name_under_allowed_roots() {
+        let root = unique_temp_dir("terminal-allowed-root");
+        let repo = root.join("speakx").join("zivon-v2").join("zivon-frontend");
+        fs::create_dir_all(&repo).expect("repo dir");
+
+        let cwd = resolve_terminal_cwd(&[root.clone()], None, Some("zivon-frontend"))
+            .expect("terminal cwd should resolve repo name inside allowed roots");
+
+        assert_eq!(cwd, repo.canonicalize().unwrap());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

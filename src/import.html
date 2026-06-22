@@ -25,6 +25,10 @@
       }
       .count { color: var(--muted); font-size: 13px; white-space: nowrap; }
       .list { flex: 1; overflow: auto; margin: 0 22px; border: 1px solid var(--border); border-radius: 12px; }
+      .notice {
+        margin: 0 22px 12px; padding: 10px 12px; border: 1px solid var(--border);
+        border-radius: 10px; color: var(--muted); background: var(--panel); font-size: 12.5px;
+      }
       .row { display: flex; gap: 12px; padding: 11px 13px; border-bottom: 1px solid var(--border); align-items: flex-start; }
       .row:last-child { border-bottom: 0; }
       .row:hover { background: var(--panel); }
@@ -40,6 +44,7 @@
       .log { margin: 12px 22px 0; font-size: 12.5px; max-height: 26vh; overflow: auto; }
       .log .item { padding: 6px 0; border-bottom: 1px solid var(--border); }
       .log a { color: var(--clay-hover); }
+      .repair { margin-left: 8px; }
       footer {
         padding: 14px 22px; border-top: 1px solid var(--border);
         display: flex; align-items: center; gap: 16px; background: var(--bg);
@@ -47,6 +52,7 @@
       .bar { flex: 1; height: 8px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
       .bar > div { height: 100%; width: 0; background: var(--clay); transition: width 0.2s; }
       .empty { padding: 26px; color: var(--muted); text-align: center; }
+      .err { color: var(--danger); }
     </style>
   </head>
   <body>
@@ -58,15 +64,17 @@
           </span>
           <h1>Import Claude sessions</h1>
         </div>
-        <p class="sub">Bring your local Claude Code sessions into Envoy and continue them. Imported into your Envoy.</p>
+        <p class="sub">Bring a compact Claude Code handoff into Envoy and continue from there.</p>
       </header>
 
       <div class="toolbar">
-        <button class="link" id="selAll">Select all</button>
+        <button class="link" id="selAll">Select visible</button>
         <button class="link" id="selNone">Select none</button>
         <span class="grow"><input type="search" id="filter" placeholder="Filter by project or text…" /></span>
         <span class="count" id="count"></span>
       </div>
+
+      <div class="notice" id="notice">Showing all Claude sessions. Nothing is selected by default. Select up to 3; imports are compacted into a single Envoy handoff message so large transcripts do not freeze chat history.</div>
 
       <div class="list" id="list"><div class="empty">Scanning ~/.claude…</div></div>
 
@@ -83,8 +91,10 @@
       const { invoke } = window.__TAURI__.core;
       const { listen } = window.__TAURI__.event;
       const $ = (id) => document.getElementById(id);
+      const MAX_IMPORT = 3;
 
       let sessions = [];
+      let visibleSessionIds = [];
       const sel = new Set();
       let importing = false;
 
@@ -100,10 +110,16 @@
         $("importBtn").disabled = sel.size === 0 || importing;
       }
 
+      function setNotice(text, isError = false) {
+        $("notice").textContent = text;
+        $("notice").classList.toggle("err", isError);
+      }
+
       function renderList() {
         const q = $("filter").value.trim().toLowerCase();
         const list = $("list");
         const shown = sessions.filter((s) => !q || (s.project + " " + s.preview).toLowerCase().includes(q));
+        visibleSessionIds = shown.map((s) => s.session_id);
         if (!shown.length) { list.innerHTML = '<div class="empty">No sessions match.</div>'; return; }
         list.innerHTML = "";
         for (const s of shown) {
@@ -117,7 +133,13 @@
               <div class="prev">${escapeHtml(s.preview)}</div>
             </span>`;
           row.querySelector("input").addEventListener("change", (e) => {
+            if (e.target.checked && sel.size >= MAX_IMPORT && !sel.has(s.session_id)) {
+              e.target.checked = false;
+              setNotice(`Select at most ${MAX_IMPORT} Claude sessions per import.`, true);
+              return;
+            }
             e.target.checked ? sel.add(s.session_id) : sel.delete(s.session_id);
+            setNotice("Imports are compacted into a single Envoy handoff message before the session is opened.");
             refreshCount();
           });
           list.appendChild(row);
@@ -128,7 +150,6 @@
         try {
           sessions = await invoke("claude_list_sessions");
           if (!sessions.length) { $("list").innerHTML = '<div class="empty">No Claude Code sessions found under ~/.claude.</div>'; return; }
-          sessions.forEach((s) => sel.add(s.session_id)); // default: all selected
           renderList();
           refreshCount();
         } catch (e) {
@@ -137,8 +158,19 @@
       }
       load();
 
-      $("selAll").addEventListener("click", () => { sessions.forEach((s) => sel.add(s.session_id)); renderList(); refreshCount(); });
-      $("selNone").addEventListener("click", () => { sel.clear(); renderList(); refreshCount(); });
+      $("selAll").addEventListener("click", () => {
+        sel.clear();
+        visibleSessionIds.slice(0, MAX_IMPORT).forEach((id) => sel.add(id));
+        setNotice(`Selected ${sel.size} visible Claude session${sel.size === 1 ? "" : "s"}.`);
+        renderList();
+        refreshCount();
+      });
+      $("selNone").addEventListener("click", () => {
+        sel.clear();
+        setNotice("Nothing selected. Choose the Claude session you want to continue in Envoy.");
+        renderList();
+        refreshCount();
+      });
       $("filter").addEventListener("input", renderList);
 
       // progress events from Rust
@@ -149,17 +181,19 @@
         if (ev.type === "session_start") {
           const d = document.createElement("div");
           d.className = "item"; d.id = "s-" + ev.session_id;
-          d.innerHTML = `<span class="spinner"></span> Importing <b>${escapeHtml(shortProj(ev.project))}</b> (${ev.turns} turns)…`;
+          d.innerHTML = `<span class="spinner"></span> Compacting <b>${escapeHtml(shortProj(ev.project))}</b> (${ev.turns} turns) into one Envoy handoff…`;
           log.prepend(d);
           $("progressText").textContent = `Session ${ev.index} of ${ev.total}`;
         } else if (ev.type === "session_done") {
           doneCount++;
           const d = $("s-" + ev.session_id);
-          if (d) d.innerHTML = `<span class="ok">✓</span> ${escapeHtml(ev.title)} — ${ev.turns_written} turns · <button class="link" data-url="${ev.url}">Open in Envoy →</button>`;
+          const originalTurns = ev.original_turns || ev.turns_written;
+          if (d) d.innerHTML = `<span class="ok">✓</span> ${escapeHtml(ev.title)} — compacted ${originalTurns} turns to ${ev.turns_written} handoff · <button class="link" data-url="${ev.url}">Open in Envoy →</button>`;
           $("barFill").style.width = Math.round((doneCount / totalToImport) * 100) + "%";
         } else if (ev.type === "session_error") {
           const d = $("s-" + ev.session_id) || log;
-          d.innerHTML = `<span class="err">✗ ${escapeHtml(ev.message)}</span>`;
+          const canRepair = String(ev.message || "").toLowerCase().includes("desktop session expired");
+          d.innerHTML = `<span class="err">✗ ${escapeHtml(ev.message)}</span>${canRepair ? ' <button class="link repair" data-repair="1">Refresh desktop session</button>' : ''}`;
           doneCount++;
         } else if (ev.type === "all_done") {
           importing = false;
@@ -172,6 +206,13 @@
       $("log").addEventListener("click", (e) => {
         const btn = e.target.closest("button[data-url]");
         if (btn) invoke("open_session_in_app", { url: btn.getAttribute("data-url") });
+        const repair = e.target.closest("button[data-repair]");
+        if (repair) {
+          $("progressText").textContent = "Opening sign-in...";
+          invoke("repair_desktop_session")
+            .then(() => setNotice("Finish sign-in in the browser, then retry import."))
+            .catch((err) => setNotice("Could not open sign-in: " + String(err), true));
+        }
       });
 
       $("importBtn").addEventListener("click", async () => {
