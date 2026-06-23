@@ -582,7 +582,8 @@ fn main() {
             import::claude_list_sessions,
             import::claude_import,
             import::repair_desktop_session,
-            import::open_session_in_app
+            import::open_session_in_app,
+            import::open_sessions_in_app
         ])
         .setup(|app| {
             let handle = app.handle().clone();

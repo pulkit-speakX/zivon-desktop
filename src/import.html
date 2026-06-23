@@ -175,20 +175,22 @@
 
       // progress events from Rust
       let totalToImport = 0, doneCount = 0;
+      let importedUrls = [];
       listen("import://progress", (event) => {
         const ev = event.payload;
         const log = $("log");
         if (ev.type === "session_start") {
           const d = document.createElement("div");
           d.className = "item"; d.id = "s-" + ev.session_id;
-          d.innerHTML = `<span class="spinner"></span> Compacting <b>${escapeHtml(shortProj(ev.project))}</b> (${ev.turns} turns) into one Envoy handoff…`;
+          d.innerHTML = `<span class="spinner"></span> Compacting <b>${escapeHtml(shortProj(ev.project))}</b> (${ev.turns} turns)…`;
           log.prepend(d);
           $("progressText").textContent = `Session ${ev.index} of ${ev.total}`;
         } else if (ev.type === "session_done") {
           doneCount++;
           const d = $("s-" + ev.session_id);
           const originalTurns = ev.original_turns || ev.turns_written;
-          if (d) d.innerHTML = `<span class="ok">✓</span> ${escapeHtml(ev.title)} — compacted ${originalTurns} turns to ${ev.turns_written} handoff · <button class="link" data-url="${ev.url}">Open in Envoy →</button>`;
+          if (ev.url) importedUrls.push(ev.url);
+          if (d) d.innerHTML = `<span class="ok">✓</span> ${escapeHtml(ev.title)} — compacted ${originalTurns} turns`;
           $("barFill").style.width = Math.round((doneCount / totalToImport) * 100) + "%";
         } else if (ev.type === "session_error") {
           const d = $("s-" + ev.session_id) || log;
@@ -197,6 +199,13 @@
           doneCount++;
         } else if (ev.type === "all_done") {
           importing = false;
+          importedUrls = Array.isArray(ev.urls) && ev.urls.length ? ev.urls : importedUrls;
+          if (importedUrls.length) {
+            const d = document.createElement("div");
+            d.className = "item";
+            d.innerHTML = `<span class="ok">✓</span> Imported ${importedUrls.length} Envoy session${importedUrls.length === 1 ? "" : "s"} · <button class="link" data-urls="${escapeHtml(JSON.stringify(importedUrls))}">Open in Envoy →</button>`;
+            log.prepend(d);
+          }
           $("progressText").textContent = "Done.";
           refreshCount();
         }
@@ -206,6 +215,17 @@
       $("log").addEventListener("click", (e) => {
         const btn = e.target.closest("button[data-url]");
         if (btn) invoke("open_session_in_app", { url: btn.getAttribute("data-url") });
+        const batchBtn = e.target.closest("button[data-urls]");
+        if (batchBtn) {
+          let urls = [];
+          try { urls = JSON.parse(batchBtn.getAttribute("data-urls") || "[]"); } catch {}
+          if (urls.length) {
+            $("progressText").textContent = "Opening in Envoy...";
+            invoke("open_sessions_in_app", { urls })
+              .then(() => { $("progressText").textContent = "Opened."; })
+              .catch((err) => setNotice("Could not open imported sessions: " + String(err), true));
+          }
+        }
         const repair = e.target.closest("button[data-repair]");
         if (repair) {
           $("progressText").textContent = "Opening sign-in...";
@@ -218,7 +238,7 @@
       $("importBtn").addEventListener("click", async () => {
         const ids = [...sel];
         if (!ids.length || importing) return;
-        importing = true; doneCount = 0; totalToImport = ids.length;
+        importing = true; doneCount = 0; totalToImport = ids.length; importedUrls = [];
         $("log").innerHTML = ""; $("barFill").style.width = "0";
         refreshCount();
         try {

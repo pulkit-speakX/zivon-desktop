@@ -28,7 +28,6 @@ const KEYRING_SERVICE: &str = "ai.zivon.envoy.desktop";
 const KEYRING_SESSION: &str = "session";
 const CLAUDE_IMPORT_SESSION_LIMIT: usize = 3;
 const IMPORT_COMPACTION_RECENT_TURNS: usize = 8;
-const IMPORT_VISIBLE_RECENT_TURNS: usize = 10;
 const IMPORT_COMPACTION_TURN_SNIPPET_CHARS: usize = 900;
 const IMPORT_COMPACTION_MAX_CHARS: usize = 12_000;
 
@@ -42,6 +41,7 @@ pub struct ClaudeTurn {
     pub text: String,        // content the agent sees on resume
     pub blocks: Value,       // typed blocks (array) the UI renders
     pub ts: Option<String>,  // ISO8601
+    pub history_only: bool,  // true = visible in UI scrollback, excluded from runtime context
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -237,6 +237,7 @@ fn parse_session(path: &Path) -> Option<ClaudeSession> {
                 text: text.clone(),
                 blocks: json!([]),
                 ts,
+                history_only: false,
             });
         } else if role == "assistant" {
             let mut blocks: Vec<Value> = Vec::new();
@@ -296,12 +297,13 @@ fn parse_session(path: &Path) -> Option<ClaudeSession> {
                 }
                 text = format!("[used tools: {}]", seen.join(", "));
             }
-            turns.push(ClaudeTurn {
-                role: "assistant".into(),
-                text,
-                blocks: Value::Array(blocks),
-                ts,
-            });
+                turns.push(ClaudeTurn {
+                    role: "assistant".into(),
+                    text,
+                    blocks: Value::Array(blocks),
+                    ts,
+                    history_only: false,
+                });
         }
     }
 
@@ -524,9 +526,26 @@ fn tool_names_from_blocks(blocks: &Value) -> Vec<String> {
     names
 }
 
-fn compact_session_turn(sess: &ClaudeSession) -> ClaudeTurn {
+fn session_topic(sess: &ClaudeSession) -> String {
+    let topic = compact_whitespace(&sess.preview);
+    if !topic.is_empty() && topic != "(no text prompt)" {
+        return truncate_chars(&topic, 82);
+    }
+    Path::new(&sess.project)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| truncate_chars(name, 82))
+        .unwrap_or_else(|| "Claude session".to_string())
+}
+
+fn import_title_for_session(session: &ClaudeSession) -> String {
+    truncate_chars(&format!("Claude: {}", session_topic(session)), 96)
+}
+
+fn session_handoff_lines(sess: &ClaudeSession, heading: &str, recent_limit: usize, include_guidance: bool) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push("Imported Claude Code handoff".to_string());
+    lines.push(heading.to_string());
     lines.push(format!("Project: {}", sess.project));
     lines.push(format!("Working directory: {}", sess.cwd));
     if let Some(branch) = &sess.git_branch {
@@ -556,7 +575,7 @@ fn compact_session_turn(sess: &ClaudeSession) -> ClaudeTurn {
         .iter()
         .filter(|turn| !turn.text.trim().is_empty())
         .rev()
-        .take(IMPORT_COMPACTION_RECENT_TURNS)
+        .take(recent_limit)
         .collect();
     recent.reverse();
     if !recent.is_empty() {
@@ -573,8 +592,21 @@ fn compact_session_turn(sess: &ClaudeSession) -> ClaudeTurn {
         }
     }
 
-    lines.push(String::new());
-    lines.push("Continuation guidance: continue from this compact handoff. Treat omitted raw turns as intentionally compacted; ask the user before relying on details that are not present here.".to_string());
+    if include_guidance {
+        lines.push(String::new());
+        lines.push("Continuation guidance: continue from this compact handoff. Treat omitted raw turns as intentionally compacted; ask the user before relying on details that are not present here.".to_string());
+    }
+
+    lines
+}
+
+fn compact_session_turn(sess: &ClaudeSession) -> ClaudeTurn {
+    let lines = session_handoff_lines(
+        sess,
+        "Imported Claude Code handoff",
+        IMPORT_COMPACTION_RECENT_TURNS,
+        true,
+    );
 
     let text = truncate_chars(&lines.join("\n"), IMPORT_COMPACTION_MAX_CHARS);
     ClaudeTurn {
@@ -582,21 +614,22 @@ fn compact_session_turn(sess: &ClaudeSession) -> ClaudeTurn {
         text: text.clone(),
         blocks: json!([{ "kind": "text", "text": text }]),
         ts: sess.last_at.clone(),
+        history_only: false,
     }
 }
 
 fn import_turns_for_session(sess: &ClaudeSession) -> Vec<ClaudeTurn> {
     let mut turns = vec![compact_session_turn(sess)];
-    let mut recent: Vec<ClaudeTurn> = sess
-        .turns
-        .iter()
-        .filter(|turn| !turn.text.trim().is_empty())
-        .rev()
-        .take(IMPORT_VISIBLE_RECENT_TURNS)
-        .cloned()
-        .collect();
-    recent.reverse();
-    turns.extend(recent);
+    turns.extend(
+        sess.turns
+            .iter()
+            .filter(|turn| !turn.text.trim().is_empty())
+            .cloned()
+            .map(|mut turn| {
+                turn.history_only = true;
+                turn
+            }),
+    );
     turns
 }
 
@@ -719,8 +752,17 @@ fn refresh_identity(ident: &mut Identity) -> Result<(), String> {
 fn post_import(endpoint: &str, token: &str, body: Value) -> Result<ureq::Response, ureq::Error> {
     ureq::post(endpoint)
         .set("Authorization", &format!("Bearer {}", token))
+        .set("X-Envoy-Client-Surface", "desktop")
         .set("Content-Type", "application/json")
         .send_json(body)
+}
+
+fn post_resume(endpoint: &str, token: &str) -> Result<ureq::Response, ureq::Error> {
+    ureq::post(endpoint)
+        .set("Authorization", &format!("Bearer {}", token))
+        .set("X-Envoy-Client-Surface", "desktop")
+        .set("Content-Type", "application/json")
+        .send_json(json!({}))
 }
 
 fn should_abort_import_batch_after_refresh_error(message: &str) -> bool {
@@ -925,14 +967,9 @@ pub fn claude_import(app: AppHandle, state: State<ImportState>, session_ids: Vec
             GATEWAY_URL, ident.slug
         );
         let mut aborted = false;
+        let mut imported_urls: Vec<String> = Vec::new();
         for (i, sess) in selected.iter().enumerate() {
-            let title = format!(
-                "[Imported] {}",
-                Path::new(&sess.project)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Claude session")
-            );
+            let title = import_title_for_session(sess);
             let _ = app.emit(
                 "import://progress",
                 json!({
@@ -954,6 +991,7 @@ pub fn claude_import(app: AppHandle, state: State<ImportState>, session_ids: Vec
                         "content": turn.text,
                         "blocks": turn.blocks,
                         "ts": turn.ts,
+                        "history_only": turn.history_only,
                     })
                 })
                 .collect();
@@ -992,6 +1030,11 @@ pub fn claude_import(app: AppHandle, state: State<ImportState>, session_ids: Vec
             match resp {
                 Ok(r) => {
                     let v: Value = r.into_json().unwrap_or(Value::Null);
+                    if let Some(url) = v.get("url").and_then(Value::as_str) {
+                        if !url.is_empty() {
+                            imported_urls.push(url.to_string());
+                        }
+                    }
                     let _ = app.emit(
                         "import://progress",
                         json!({
@@ -1026,7 +1069,7 @@ pub fn claude_import(app: AppHandle, state: State<ImportState>, session_ids: Vec
         }
         let _ = app.emit(
             "import://progress",
-            json!({ "type": "all_done", "count": if aborted { 0 } else { total } }),
+            json!({ "type": "all_done", "count": if aborted { 0 } else { imported_urls.len() }, "urls": imported_urls }),
         );
     });
 
@@ -1038,22 +1081,102 @@ pub fn repair_desktop_session(app: AppHandle) -> Result<(), String> {
     crate::start_login(&app)
 }
 
+fn full_app_url(url: &str, strip_query: bool) -> Result<tauri::Url, String> {
+    let full = if url.starts_with("http") {
+        url.to_string()
+    } else {
+        format!("http://localhost:3000{url}")
+    };
+    let mut parsed = tauri::Url::parse(&full).map_err(|e| e.to_string())?;
+    if strip_query {
+        parsed.set_query(None);
+    }
+    Ok(parsed)
+}
+
+fn session_id_from_import_url(url: &str) -> Option<String> {
+    let parsed = full_app_url(url, false).ok()?;
+    let mut segments = parsed.path_segments()?;
+    while let Some(segment) = segments.next() {
+        if segment == "agent" {
+            return segments.next().map(ToString::to_string);
+        }
+    }
+    None
+}
+
+fn resume_imported_session(ident: &mut Identity, session_id: &str) -> Result<(), String> {
+    let endpoint = format!(
+        "{}/api/core/api/orgs/{}/pods/sessions/{}/resume",
+        GATEWAY_URL, ident.slug, session_id
+    );
+    let mut resp = post_resume(&endpoint, &ident.token);
+    if matches!(resp, Err(ureq::Error::Status(401, _))) {
+        refresh_identity(ident)?;
+        resp = post_resume(&endpoint, &ident.token);
+    }
+    match resp {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(409, r)) => {
+            let detail = r.into_string().unwrap_or_default();
+            if detail.contains("already active") {
+                Ok(())
+            } else {
+                Err(format!("resume failed for {session_id}: HTTP 409: {}", detail.chars().take(180).collect::<String>()))
+            }
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r.into_string().unwrap_or_default();
+            Err(format!(
+                "resume failed for {session_id}: HTTP {code}: {}",
+                detail.chars().take(180).collect::<String>()
+            ))
+        }
+        Err(ureq::Error::Transport(t)) => Err(format!("resume failed for {session_id}: network: {t}")),
+    }
+}
+
 /// Open an imported session in the main Envoy window (navigate it there).
 #[tauri::command]
 pub fn open_session_in_app(app: AppHandle, url: String) -> Result<(), String> {
-    let full = if url.starts_with("http") {
-        url
-    } else {
-        // The app window is already on the Envoy origin; navigate within it.
-        format!("http://localhost:3000{url}")
-    };
     if app.get_webview_window("app").is_none() {
         if let Some(bundle) = crate::load_session() {
             crate::create_app_window(&app, bundle).map_err(|e| e.to_string())?;
         }
     }
     if let Some(w) = app.get_webview_window("app") {
-        let parsed = tauri::Url::parse(&full).map_err(|e| e.to_string())?;
+        let parsed = full_app_url(&url, false)?;
+        w.navigate(parsed).map_err(|e| e.to_string())?;
+        let _ = w.show();
+        let _ = w.set_focus();
+        Ok(())
+    } else {
+        Err("Envoy window not open — sign in first".into())
+    }
+}
+
+/// Resume a batch of imported desktop sessions, then show the first one.
+#[tauri::command]
+pub fn open_sessions_in_app(app: AppHandle, urls: Vec<String>) -> Result<(), String> {
+    if urls.is_empty() {
+        return Err("No imported sessions to open".to_string());
+    }
+    request_app_session_sync(&app);
+    let mut ident = load_identity()?;
+    for url in &urls {
+        let Some(session_id) = session_id_from_import_url(url) else {
+            return Err("Imported session URL is invalid".to_string());
+        };
+        resume_imported_session(&mut ident, &session_id)?;
+    }
+
+    if app.get_webview_window("app").is_none() {
+        if let Some(bundle) = crate::load_session() {
+            crate::create_app_window(&app, bundle).map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(w) = app.get_webview_window("app") {
+        let parsed = full_app_url(&urls[0], true)?;
         w.navigate(parsed).map_err(|e| e.to_string())?;
         let _ = w.show();
         let _ = w.set_focus();
@@ -1129,30 +1252,34 @@ mod tests {
             preview: "build cowork import".to_string(),
             path: "/tmp/claude-123.jsonl".to_string(),
             turns: vec![
-                ClaudeTurn {
-                    role: "user".to_string(),
-                    text: "Build the Cowork-style import flow.".to_string(),
-                    blocks: json!([]),
-                    ts: None,
-                },
-                ClaudeTurn {
-                    role: "assistant".to_string(),
-                    text: "I inspected the importer and found every session selected by default.".to_string(),
-                    blocks: json!([{ "kind": "text", "text": "I inspected the importer." }]),
-                    ts: None,
-                },
-                ClaudeTurn {
-                    role: "user".to_string(),
-                    text: "Make it production-like and avoid huge histories.".to_string(),
-                    blocks: json!([]),
-                    ts: None,
-                },
-                ClaudeTurn {
-                    role: "assistant".to_string(),
-                    text: "I will compact the imported transcript into a handoff.".to_string(),
-                    blocks: json!([]),
-                    ts: None,
-                },
+	                ClaudeTurn {
+	                    role: "user".to_string(),
+	                    text: "Build the Cowork-style import flow.".to_string(),
+	                    blocks: json!([]),
+	                    ts: None,
+	                    history_only: false,
+	                },
+	                ClaudeTurn {
+	                    role: "assistant".to_string(),
+	                    text: "I inspected the importer and found every session selected by default.".to_string(),
+	                    blocks: json!([{ "kind": "text", "text": "I inspected the importer." }]),
+	                    ts: None,
+	                    history_only: false,
+	                },
+	                ClaudeTurn {
+	                    role: "user".to_string(),
+	                    text: "Make it production-like and avoid huge histories.".to_string(),
+	                    blocks: json!([]),
+	                    ts: None,
+	                    history_only: false,
+	                },
+	                ClaudeTurn {
+	                    role: "assistant".to_string(),
+	                    text: "I will compact the imported transcript into a handoff.".to_string(),
+	                    blocks: json!([]),
+	                    ts: None,
+	                    history_only: false,
+	                },
             ],
         };
 
@@ -1163,18 +1290,19 @@ mod tests {
         assert!(turn.text.contains("Original turns: 4"));
         assert!(turn.text.contains("Build the Cowork-style import flow."));
         assert!(turn.text.len() <= IMPORT_COMPACTION_MAX_CHARS + 3);
-    }
+	}
 
-    #[test]
-    fn import_turns_include_handoff_plus_last_ten_turns() {
-        let turns: Vec<ClaudeTurn> = (0..15)
-            .map(|i| ClaudeTurn {
-                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
-                text: format!("turn-{i}"),
-                blocks: json!([]),
-                ts: None,
-            })
-            .collect();
+	#[test]
+	fn import_turns_include_handoff_plus_full_history_scrollback() {
+	    let turns: Vec<ClaudeTurn> = (0..15)
+	        .map(|i| ClaudeTurn {
+	            role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+	            text: format!("turn-{i}"),
+	            blocks: json!([]),
+	            ts: None,
+	            history_only: false,
+	        })
+	        .collect();
         let session = ClaudeSession {
             session_id: "claude-456".to_string(),
             project: "/tmp/project".to_string(),
@@ -1188,12 +1316,44 @@ mod tests {
             turns,
         };
 
-        let import_turns = import_turns_for_session(&session);
+	    let import_turns = import_turns_for_session(&session);
 
-        assert_eq!(import_turns.len(), 11);
-        assert!(import_turns[0].text.contains("Imported Claude Code handoff"));
-        assert_eq!(import_turns[1].text, "turn-5");
-        assert_eq!(import_turns[10].text, "turn-14");
+	    assert_eq!(import_turns.len(), 16);
+	    assert!(import_turns[0].text.contains("Imported Claude Code handoff"));
+	    assert!(!import_turns[0].history_only);
+	    assert_eq!(import_turns[1].text, "turn-0");
+	    assert_eq!(import_turns[15].text, "turn-14");
+	    assert!(import_turns[1..].iter().all(|turn| turn.history_only));
+	}
+
+    #[test]
+    fn import_title_uses_conversation_topic_not_project_folder() {
+        let session = ClaudeSession {
+            session_id: "claude-a".to_string(),
+            project: "/Users/pulkitnagpal/Desktop/speakx/zivon-v2".to_string(),
+            cwd: "/Users/pulkitnagpal/Desktop/speakx/zivon-v2".to_string(),
+            git_branch: None,
+            started_at: None,
+            last_at: None,
+            turn_count: 1,
+            preview: "Fix Claude import auto resume in desktop worker".to_string(),
+            path: "/tmp/claude-a.jsonl".to_string(),
+            turns: vec![],
+        };
+
+        let title = import_title_for_session(&session);
+
+        assert!(title.contains("Fix Claude import auto resume"));
+        assert!(!title.contains("zivon-v2"));
+    }
+
+    #[test]
+    fn import_url_parsing_extracts_session_id() {
+        let id = session_id_from_import_url(
+            "/org/speakx-dev/agent/64e7f4f74f4f4f4f4f4f4f4f?auto_resume=1&source=claude_import",
+        );
+
+        assert_eq!(id.as_deref(), Some("64e7f4f74f4f4f4f4f4f4f4f"));
     }
 
     #[test]
