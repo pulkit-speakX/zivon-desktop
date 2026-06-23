@@ -18,6 +18,8 @@ use crate::{KEYRING_SERVICE, KEYRING_SESSION};
 const KEYRING_RUNTIME_DEVICE: &str = "runtime_device_id";
 const GATEWAY_URL: &str = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_SECONDS: u64 = 5;
+const STREAM_FRAME_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
+const STREAM_FRAME_FLUSH_BYTES: usize = 1024;
 
 #[derive(Clone, Debug)]
 struct SupervisorIdentity {
@@ -74,6 +76,59 @@ struct RuntimeTurnResult {
     blocks: Vec<Value>,
     todos: Vec<Value>,
     ended_in_clarify: bool,
+}
+
+struct PendingStreamFrame {
+    frame: Value,
+    frame_type: String,
+    sub_agent_id: Option<String>,
+    bytes: usize,
+    first_seen_at: Instant,
+}
+
+#[derive(Default)]
+struct RuntimeStreamFrameCoalescer {
+    pending: Option<PendingStreamFrame>,
+}
+
+impl RuntimeStreamFrameCoalescer {
+    fn ingest(&mut self, frame: Value, now: Instant) -> Vec<Value> {
+        let Some((frame_type, sub_agent_id, content)) = coalescible_stream_frame(&frame) else {
+            let mut out = self.flush();
+            out.push(frame);
+            return out;
+        };
+
+        if let Some(pending) = self.pending.as_mut() {
+            if pending.frame_type == frame_type && pending.sub_agent_id == sub_agent_id {
+                append_stream_frame_content(&mut pending.frame, &content);
+                pending.bytes += content.len();
+                if pending.bytes >= STREAM_FRAME_FLUSH_BYTES
+                    || now.duration_since(pending.first_seen_at) >= STREAM_FRAME_FLUSH_INTERVAL
+                {
+                    return self.flush();
+                }
+                return vec![];
+            }
+        }
+
+        let out = self.flush();
+        self.pending = Some(PendingStreamFrame {
+            frame,
+            frame_type,
+            sub_agent_id,
+            bytes: content.len(),
+            first_seen_at: now,
+        });
+        out
+    }
+
+    fn flush(&mut self) -> Vec<Value> {
+        self.pending
+            .take()
+            .map(|pending| vec![pending.frame])
+            .unwrap_or_default()
+    }
 }
 
 struct LocalRuntimeWorker {
@@ -625,6 +680,29 @@ fn handle_runtime_commands(
                     )?;
                 }
             }
+        } else if command.command_type == "abort_turn" {
+            match abort_runtime_turn(workers, &command, abort_local_envoy_turn) {
+                Ok(worker) => {
+                    ack_runtime_command(
+                        identity,
+                        device_id,
+                        &command,
+                        "accepted",
+                        "desktop worker turn abort requested",
+                        worker,
+                    )?;
+                }
+                Err(err) => {
+                    ack_runtime_command(
+                        identity,
+                        device_id,
+                        &command,
+                        "failed",
+                        &format!("desktop worker turn abort failed: {err}"),
+                        None,
+                    )?;
+                }
+            }
         } else {
             ack_runtime_command(
                 identity,
@@ -831,6 +909,50 @@ fn stop_runtime_worker<'a>(
     }
     worker.status = "stopped".to_string();
     Ok(Some(worker))
+}
+
+fn abort_runtime_turn<'a, F>(
+    workers: &'a [LocalRuntimeWorker],
+    command: &RuntimeCommand,
+    abort_fn: F,
+) -> Result<Option<&'a LocalRuntimeWorker>, String>
+where
+    F: FnOnce(u16, &str) -> Result<(), String>,
+{
+    let Some(worker) = workers.iter().find(|worker| {
+        worker.session_id == command.session_id
+            && command
+                .run_id
+                .as_deref()
+                .map(|run_id| run_id == worker.run_id)
+                .unwrap_or(true)
+    }) else {
+        return Ok(None);
+    };
+
+    if worker.status == "stopped" {
+        return Ok(Some(worker));
+    }
+
+    abort_fn(worker.port, &worker.session_id)?;
+    Ok(Some(worker))
+}
+
+fn abort_local_envoy_turn(port: u16, session_id: &str) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/abort");
+    let resp = ureq::post(&url)
+        .timeout(Duration::from_secs(5))
+        .set("Content-Type", "application/json")
+        .send_json(json!({ "session_id": session_id }));
+    match resp {
+        Ok(r) if (200..300).contains(&r.status()) => Ok(()),
+        Ok(r) => Err(format!("local envoy2 abort returned HTTP {}", r.status())),
+        Err(ureq::Error::Status(code, r)) => Err(format!(
+            "local envoy2 abort returned HTTP {code}: {}",
+            r.into_string().unwrap_or_default()
+        )),
+        Err(ureq::Error::Transport(t)) => Err(format!("local envoy2 abort network: {t}")),
+    }
 }
 
 #[cfg(unix)]
@@ -1128,6 +1250,36 @@ fn identity_user_email(identity: &SupervisorIdentity) -> String {
         .unwrap_or_default()
 }
 
+fn coalescible_stream_frame(frame: &Value) -> Option<(String, Option<String>, String)> {
+    let frame_type = frame.get("type")?.as_str()?.to_string();
+    if !matches!(frame_type.as_str(), "text" | "thinking") {
+        return None;
+    }
+    let content = frame.get("content")?.as_str()?.to_string();
+    if content.is_empty() {
+        return None;
+    }
+    let sub_agent_id = frame
+        .get("sub_agent_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    Some((frame_type, sub_agent_id, content))
+}
+
+fn append_stream_frame_content(frame: &mut Value, content: &str) {
+    let Some(obj) = frame.as_object_mut() else {
+        return;
+    };
+    let mut next = obj
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    next.push_str(content);
+    obj.insert("content".to_string(), Value::String(next));
+}
+
 fn relay_envoy2_sse(
     identity: &SupervisorIdentity,
     turn: &RuntimeTurn,
@@ -1135,6 +1287,7 @@ fn relay_envoy2_sse(
 ) -> Result<RuntimeTurnResult, String> {
     let mut reader = BufReader::new(response.into_reader());
     let mut line = String::new();
+    let mut coalescer = RuntimeStreamFrameCoalescer::default();
     let mut result = RuntimeTurnResult {
         response: String::new(),
         error: String::new(),
@@ -1163,10 +1316,16 @@ fn relay_envoy2_sse(
         let frame: Value = serde_json::from_str(raw)
             .map_err(|e| format!("decode local envoy2 SSE frame: {e}: {raw}"))?;
         apply_runtime_frame(&mut result, &frame);
-        post_runtime_turn_event(identity, turn, &frame)?;
+        for outbound in coalescer.ingest(frame.clone(), Instant::now()) {
+            post_runtime_turn_event(identity, turn, &outbound)?;
+        }
         if frame.get("type").and_then(Value::as_str) == Some("done") || !result.error.is_empty() {
             break;
         }
+    }
+
+    for outbound in coalescer.flush() {
+        post_runtime_turn_event(identity, turn, &outbound)?;
     }
 
     Ok(result)
@@ -1601,6 +1760,36 @@ mod tests {
     }
 
     #[test]
+    fn abort_turn_requests_local_abort_without_stopping_worker() {
+        let workers = vec![LocalRuntimeWorker::test_worker(
+            "cmd-1", "sess-1", "run-1", 12345, 49152,
+        )];
+        let command = RuntimeCommand {
+            command_id: "abort-1".to_string(),
+            command_type: "abort_turn".to_string(),
+            session_id: "sess-1".to_string(),
+            run_id: Some("run-1".to_string()),
+            payload: json!({}),
+        };
+        let mut called: Option<(u16, String)> = None;
+
+        let worker = abort_runtime_turn(&workers, &command, |port, session_id| {
+            called = Some((port, session_id.to_string()));
+            Ok(())
+        })
+        .expect("abort command should succeed")
+        .expect("worker should be found");
+
+        assert_eq!(called, Some((49152, "sess-1".to_string())));
+        assert_eq!(worker.status, "running");
+        assert!(!worker.stop_requested.load(Ordering::SeqCst));
+        assert_eq!(
+            active_worker_payload(&workers)[0].get("status").and_then(Value::as_str),
+            Some("running")
+        );
+    }
+
+    #[test]
     fn runtime_frame_accumulator_tracks_text_blocks_todos_and_clarify() {
         let mut result = RuntimeTurnResult {
             response: String::new(),
@@ -1628,6 +1817,71 @@ mod tests {
         assert_eq!(result.blocks, vec![json!({"type":"assistant","text":"hello"})]);
         assert_eq!(result.todos, vec![json!({"text":"ship"})]);
         assert!(result.ended_in_clarify);
+    }
+
+    #[test]
+    fn stream_frame_coalescer_merges_adjacent_text_and_flushes_before_tool_events() {
+        let mut coalescer = RuntimeStreamFrameCoalescer::default();
+        let now = Instant::now();
+
+        assert!(coalescer
+            .ingest(json!({"type":"text","content":"hel"}), now)
+            .is_empty());
+        assert!(coalescer
+            .ingest(json!({"type":"text","content":"lo"}), now + Duration::from_millis(10))
+            .is_empty());
+
+        let out = coalescer.ingest(
+            json!({"type":"tool_use","tool_use_id":"tool-1","tool_name":"desktop_list_local_files"}),
+            now + Duration::from_millis(20),
+        );
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], json!({"type":"text","content":"hello"}));
+        assert_eq!(
+            out[1],
+            json!({"type":"tool_use","tool_use_id":"tool-1","tool_name":"desktop_list_local_files"})
+        );
+        assert!(coalescer.flush().is_empty());
+    }
+
+    #[test]
+    fn stream_frame_coalescer_keeps_different_subagent_streams_ordered() {
+        let mut coalescer = RuntimeStreamFrameCoalescer::default();
+        let now = Instant::now();
+
+        assert!(coalescer
+            .ingest(
+                json!({"type":"thinking","content":"alpha","sub_agent_id":"a"}),
+                now,
+            )
+            .is_empty());
+        let out = coalescer.ingest(
+            json!({"type":"thinking","content":"beta","sub_agent_id":"b"}),
+            now + Duration::from_millis(5),
+        );
+
+        assert_eq!(out, vec![json!({"type":"thinking","content":"alpha","sub_agent_id":"a"})]);
+        assert_eq!(
+            coalescer.flush(),
+            vec![json!({"type":"thinking","content":"beta","sub_agent_id":"b"})]
+        );
+    }
+
+    #[test]
+    fn stream_frame_coalescer_flushes_long_text_without_waiting_for_terminal_frame() {
+        let mut coalescer = RuntimeStreamFrameCoalescer::default();
+        let now = Instant::now();
+
+        assert!(coalescer
+            .ingest(json!({"type":"text","content":"first"}), now)
+            .is_empty());
+        let out = coalescer.ingest(
+            json!({"type":"text","content":"second"}),
+            now + STREAM_FRAME_FLUSH_INTERVAL + Duration::from_millis(1),
+        );
+
+        assert_eq!(out, vec![json!({"type":"text","content":"firstsecond"})]);
     }
 
     #[test]
