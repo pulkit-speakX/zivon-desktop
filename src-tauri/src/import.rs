@@ -792,26 +792,39 @@ async function tryLoginWithNextAuthSession(){{
     return !!(data.access_token&&data.refresh_token);
   }}catch(e){{return false;}}
 }}
+async function tryValidateCurrentAccessToken(){{
+  var access=window.localStorage.getItem('zivon_token');
+  if(!access){{return false;}}
+  try{{
+    var res=await window.fetch({gateway}+'/auth/me',{{
+      method:'GET',
+      headers:{{'Authorization':'Bearer '+access}}
+    }});
+    return !!res.ok;
+  }}catch(e){{return false;}}
+}}
+function canUseLocalDevBypassLogin(){{
+  try{{return window.localStorage.getItem('zivon_dev_bypass_login')==='true';}}catch(e){{return false;}}
+}}
 async function tryLocalDevBypassLogin(){{
+  if(!canUseLocalDevBypassLogin()){{return false;}}
   try{{
     var res=await window.fetch({gateway}+'/auth/bypass-login',{{method:'POST',headers:{{'Content-Type':'application/json'}}}});
     if(!res.ok){{return false;}}
     var data=await res.json();
     writeLoginData(data);
+    window.localStorage.setItem('zivon_dev_bypass_login','true');
     return !!(data.access_token&&data.refresh_token);
   }}catch(e){{return false;}}
 }}
 async function syncToNative(){{
   try{{
+    var syncReady=await tryRefreshWithZivonToken()
+      ||await tryLoginWithNextAuthSession()
+      ||await tryValidateCurrentAccessToken()
+      ||await tryLocalDevBypassLogin();
     var storage=collectZivonStorage();
-    if(!storage.zivon_token||!storage.zivon_refresh_token){{
-      await tryRefreshWithZivonToken()||await tryLoginWithNextAuthSession()||await tryLocalDevBypassLogin();
-      storage=collectZivonStorage();
-    }}else{{
-      await tryRefreshWithZivonToken()||await tryLoginWithNextAuthSession()||await tryLocalDevBypassLogin();
-      storage=collectZivonStorage();
-    }}
-    if(!storage.zivon_token||!storage.zivon_refresh_token){{return;}}
+    if(!syncReady||!storage.zivon_token||!storage.zivon_refresh_token){{return;}}
     await window.fetch({url},{{
       method:'POST',
       headers:{{'Content-Type':'application/json','X-Envoy-Desktop-Auth-Token':{token}}},
@@ -824,9 +837,9 @@ syncToNative();
     )
 }
 
-fn request_app_session_sync(app: &AppHandle) {
+pub(crate) fn request_app_session_sync(app: &AppHandle) -> bool {
     let Some(app_window) = app.get_webview_window("app") else {
-        return;
+        return false;
     };
     let config = app.state::<crate::DesktopAuthSyncConfig>().inner().clone();
     let previous_sync_count = config.sync_count.load(Ordering::SeqCst);
@@ -835,10 +848,11 @@ fn request_app_session_sync(app: &AppHandle) {
     let started = Instant::now();
     while started.elapsed() < Duration::from_millis(5_000) {
         if config.sync_count.load(Ordering::SeqCst) > previous_sync_count {
-            break;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    false
 }
 
 // --------------------------------------------------------------------------- //
@@ -1224,9 +1238,15 @@ mod tests {
         assert!(script.contains("zivon_token"));
         assert!(script.contains("zivon_refresh_token"));
         assert!(script.contains("/auth/refresh"));
+        assert!(script.contains("/auth/me"));
+        assert!(script.contains("tryValidateCurrentAccessToken"));
+        assert!(script.contains("syncReady"));
+        assert!(script.contains("if(!syncReady||!storage.zivon_token||!storage.zivon_refresh_token)"));
         assert!(script.contains("/api/auth/session"));
         assert!(script.contains("/auth/login"));
         assert!(script.contains("/auth/bypass-login"));
+        assert!(script.contains("zivon_dev_bypass_login"));
+        assert!(script.contains("canUseLocalDevBypassLogin"));
         assert!(script.contains("X-Envoy-Desktop-Auth-Token"));
         assert!(script.contains("native-sync-token"));
         assert!(script.contains("http://127.0.0.1:12345/auth/sync"));

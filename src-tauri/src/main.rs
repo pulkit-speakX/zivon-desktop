@@ -34,6 +34,7 @@ use tauri_plugin_opener::OpenerExt;
 
 mod desktop_bridge;
 mod import;
+mod runtime_supervisor;
 
 const KEYRING_SERVICE: &str = "ai.zivon.envoy.desktop";
 const KEYRING_SESSION: &str = "session";
@@ -388,7 +389,7 @@ pub(crate) fn create_app_window(app: &AppHandle, bundle_json: String) -> tauri::
     Ok(())
 }
 
-fn create_splash_window(app: &AppHandle) -> tauri::Result<()> {
+pub(crate) fn create_splash_window(app: &AppHandle) -> tauri::Result<()> {
     if let Some(w) = app.get_webview_window(SPLASH) {
         let _ = w.show();
         let _ = w.set_focus();
@@ -401,6 +402,14 @@ fn create_splash_window(app: &AppHandle) -> tauri::Result<()> {
         .resizable(true)
         .build()?;
     Ok(())
+}
+
+pub(crate) fn show_login_window(app: &AppHandle) -> tauri::Result<()> {
+    clear_session();
+    if let Some(app_window) = app.get_webview_window(APP) {
+        let _ = app_window.close();
+    }
+    create_splash_window(app)
 }
 
 /// Whichever content window currently exists (prefer the app window).
@@ -579,6 +588,7 @@ fn main() {
             let handle = app.handle().clone();
             let bridge = app.state::<desktop_bridge::DesktopBridgeState>().inner().clone();
             desktop_bridge::start_bridge(bridge)?;
+            runtime_supervisor::start_runtime_supervisor(handle.clone());
 
             // --- Tray / menubar ---
             let show_i = MenuItem::with_id(app, "show", "Show Envoy", true, None::<&str>)?;
