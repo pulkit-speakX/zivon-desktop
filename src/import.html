@@ -189,8 +189,13 @@
           doneCount++;
           const d = $("s-" + ev.session_id);
           const originalTurns = ev.original_turns || ev.turns_written;
+          const rawOmitted = Number(ev.raw_omitted || 0);
+          const retained = Math.max(0, Number(ev.turns_written || 1) - 1);
+          const rawNote = rawOmitted > 0
+            ? ` · retained latest ${retained} raw turns, omitted ${rawOmitted}`
+            : "";
           if (ev.url) importedUrls.push(ev.url);
-          if (d) d.innerHTML = `<span class="ok">✓</span> ${escapeHtml(ev.title)} — compacted ${originalTurns} turns`;
+          if (d) d.innerHTML = `<span class="ok">✓</span> ${escapeHtml(ev.title)} — compacted ${originalTurns} turns${escapeHtml(rawNote)}`;
           $("barFill").style.width = Math.round((doneCount / totalToImport) * 100) + "%";
         } else if (ev.type === "session_error") {
           const d = $("s-" + ev.session_id) || log;
@@ -220,10 +225,21 @@
           let urls = [];
           try { urls = JSON.parse(batchBtn.getAttribute("data-urls") || "[]"); } catch {}
           if (urls.length) {
-            $("progressText").textContent = "Opening in Envoy...";
+            batchBtn.disabled = true;
+            batchBtn.textContent = "Starting in Envoy...";
+            setNotice(`Requesting ${urls.length} Local worker${urls.length === 1 ? "" : "s"} from the desktop runtime.`);
+            $("progressText").textContent = "Starting Local workers...";
             invoke("open_sessions_in_app", { urls })
-              .then(() => { $("progressText").textContent = "Opened."; })
-              .catch((err) => setNotice("Could not open imported sessions: " + String(err), true));
+              .then((res) => {
+                const count = res && res.resumed ? res.resumed : urls.length;
+                setNotice(`Requested ${count} Local worker${count === 1 ? "" : "s"}. Opening Envoy...`);
+                $("progressText").textContent = "Opened.";
+              })
+              .catch((err) => {
+                batchBtn.disabled = false;
+                batchBtn.textContent = "Open in Envoy →";
+                setNotice("Could not open imported sessions: " + String(err), true);
+              });
           }
         }
         const repair = e.target.closest("button[data-repair]");

@@ -9,8 +9,9 @@
 //! All file reads here are TIER 0 (read-only, local). The write happens entirely
 //! server-side behind the user's authenticated identity.
 
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
@@ -30,6 +31,7 @@ const CLAUDE_IMPORT_SESSION_LIMIT: usize = 3;
 const IMPORT_COMPACTION_RECENT_TURNS: usize = 8;
 const IMPORT_COMPACTION_TURN_SNIPPET_CHARS: usize = 900;
 const IMPORT_COMPACTION_MAX_CHARS: usize = 12_000;
+const IMPORT_RAW_SCROLLBACK_MAX_TURNS: usize = 300;
 
 // --------------------------------------------------------------------------- //
 // Data model
@@ -56,6 +58,8 @@ pub struct ClaudeSession {
     pub preview: String,
     pub path: String,
     #[serde(skip)]
+    pub first_user_text: Option<String>,
+    #[serde(skip)]
     pub turns: Vec<ClaudeTurn>,
 }
 
@@ -69,6 +73,12 @@ pub struct SessionSummary {
     pub last_at: Option<String>,
     pub turn_count: usize,
     pub preview: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct OpenImportedSessionsResult {
+    pub resumed: usize,
+    pub first_url: String,
 }
 
 #[derive(Default)]
@@ -136,53 +146,54 @@ fn tool_result_text(content: &Value) -> String {
     String::new()
 }
 
-fn parse_events(path: &Path) -> Vec<Value> {
-    let mut out = Vec::new();
-    if let Ok(content) = fs::read_to_string(path) {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
+fn push_retained_turn(turns: &mut VecDeque<ClaudeTurn>, turn: ClaudeTurn) {
+    turns.push_back(turn);
+    while turns.len() > IMPORT_RAW_SCROLLBACK_MAX_TURNS {
+        turns.pop_front();
+    }
+}
+
+fn apply_tool_result_to_retained_turns(turns: &mut VecDeque<ClaudeTurn>, tool_id: &str, result: String) {
+    let result: String = result.chars().take(4000).collect();
+    for turn in turns.iter_mut().rev() {
+        let Some(blocks) = turn.blocks.as_array_mut() else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            let matches_tool = block.get("kind").and_then(Value::as_str) == Some("tool")
+                && block.get("toolUseId").and_then(Value::as_str) == Some(tool_id);
+            if !matches_tool {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<Value>(line) {
-                out.push(v);
+            if let Some(obj) = block.as_object_mut() {
+                obj.insert("status".to_string(), Value::String("done".to_string()));
+                obj.insert("result".to_string(), Value::String(result));
             }
+            return;
         }
     }
-    out
 }
 
 fn parse_session(path: &Path) -> Option<ClaudeSession> {
-    let events = parse_events(path);
-    if events.is_empty() {
-        return None;
-    }
-
-    // First pass: tool_use_id -> result text (from user tool_result blocks).
-    let mut tool_results: HashMap<String, String> = HashMap::new();
-    for ev in &events {
-        if ev.get("type").and_then(Value::as_str) != Some("user") {
-            continue;
-        }
-        if let Some(arr) = ev.pointer("/message/content").and_then(Value::as_array) {
-            for b in arr {
-                if b.get("type").and_then(Value::as_str) == Some("tool_result") {
-                    if let Some(tid) = b.get("tool_use_id").and_then(Value::as_str) {
-                        tool_results.insert(tid.to_string(), tool_result_text(b.get("content").unwrap_or(&Value::Null)));
-                    }
-                }
-            }
-        }
-    }
-
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
     let mut cwd: Option<String> = None;
     let mut git_branch: Option<String> = None;
     let mut started_at: Option<String> = None;
     let mut last_at: Option<String> = None;
     let mut preview: Option<String> = None;
-    let mut turns: Vec<ClaudeTurn> = Vec::new();
+    let mut first_user_text: Option<String> = None;
+    let mut turn_count = 0usize;
+    let mut turns: VecDeque<ClaudeTurn> = VecDeque::new();
 
-    for ev in &events {
+    for raw in reader.lines().map_while(Result::ok) {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if cwd.is_none() {
             if let Some(c) = ev.get("cwd").and_then(Value::as_str) {
                 cwd = Some(c.to_string());
@@ -204,6 +215,21 @@ fn parse_session(path: &Path) -> Option<ClaudeSession> {
         }
 
         let t = ev.get("type").and_then(Value::as_str).unwrap_or("");
+        if t == "user" {
+            if let Some(arr) = ev.pointer("/message/content").and_then(Value::as_array) {
+                for b in arr {
+                    if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                        if let Some(tid) = b.get("tool_use_id").and_then(Value::as_str) {
+                            apply_tool_result_to_retained_turns(
+                                &mut turns,
+                                tid,
+                                tool_result_text(b.get("content").unwrap_or(&Value::Null)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if t != "user" && t != "assistant" {
             continue;
         }
@@ -230,9 +256,13 @@ fn parse_session(path: &Path) -> Option<ClaudeSession> {
             if preview.is_none() {
                 preview = Some(text.trim().chars().take(200).collect());
             }
+            if first_user_text.is_none() {
+                first_user_text = Some(text.trim().to_string());
+            }
             // User turns render from `content`; no turn_payload blocks needed
             // (and the interleaved block renderer is for assistant turns only).
-            turns.push(ClaudeTurn {
+            turn_count += 1;
+            push_retained_turn(&mut turns, ClaudeTurn {
                 role: "user".into(),
                 text: text.clone(),
                 blocks: json!([]),
@@ -259,19 +289,16 @@ fn parse_session(path: &Path) -> Option<ClaudeSession> {
                             let tid = b.get("id").and_then(Value::as_str).unwrap_or("");
                             let name = b.get("name").and_then(Value::as_str).unwrap_or("tool");
                             tool_names.push(name.to_string());
-                            // Render-model tool block: a single `tool` block with the
-                            // result folded in (no separate tool_result block).
-                            let result: String = tool_results
-                                .get(tid)
-                                .map(|r| r.chars().take(4000).collect())
-                                .unwrap_or_default();
+                            // The matching tool_result may arrive later in the JSONL.
+                            // While the turn remains in the rolling scrollback window,
+                            // apply_tool_result_to_retained_turns patches the block.
                             blocks.push(json!({
                                 "kind": "tool",
                                 "toolUseId": tid,
                                 "name": name,
                                 "input": b.get("input").cloned().unwrap_or(json!({})),
-                                "status": "done",
-                                "result": result,
+                                "status": "pending",
+                                "result": "",
                             }));
                         }
                         _ => {}
@@ -297,17 +324,18 @@ fn parse_session(path: &Path) -> Option<ClaudeSession> {
                 }
                 text = format!("[used tools: {}]", seen.join(", "));
             }
-                turns.push(ClaudeTurn {
-                    role: "assistant".into(),
-                    text,
-                    blocks: Value::Array(blocks),
-                    ts,
-                    history_only: false,
-                });
+            turn_count += 1;
+            push_retained_turn(&mut turns, ClaudeTurn {
+                role: "assistant".into(),
+                text,
+                blocks: Value::Array(blocks),
+                ts,
+                history_only: false,
+            });
         }
     }
 
-    if turns.is_empty() {
+    if turn_count == 0 || turns.is_empty() {
         return None;
     }
 
@@ -326,15 +354,17 @@ fn parse_session(path: &Path) -> Option<ClaudeSession> {
         git_branch,
         started_at,
         last_at,
-        turn_count: turns.len(),
+        turn_count,
         preview: preview.unwrap_or_else(|| "(no text prompt)".into()),
         path: path.to_string_lossy().to_string(),
-        turns,
+        first_user_text,
+        turns: turns.into_iter().collect(),
     })
 }
 
 fn parse_session_summary(path: &Path, modified: Option<SystemTime>) -> Option<SessionIndexEntry> {
-    let content = fs::read_to_string(path).ok()?;
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
     let mut cwd: Option<String> = None;
     let mut git_branch: Option<String> = None;
     let mut started_at: Option<String> = None;
@@ -342,7 +372,7 @@ fn parse_session_summary(path: &Path, modified: Option<SystemTime>) -> Option<Se
     let mut preview: Option<String> = None;
     let mut turn_count = 0usize;
 
-    for raw in content.lines() {
+    for raw in reader.lines().map_while(Result::ok) {
         let line = raw.trim();
         if line.is_empty() {
             continue;
@@ -559,15 +589,30 @@ fn session_handoff_lines(sess: &ClaudeSession, heading: &str, recent_limit: usiz
     }
     lines.push(format!("Original Claude session id: {}", sess.session_id));
     lines.push(format!("Original turns: {}", sess.turn_count));
-
-    if let Some(first_user) = sess
+    let visible_raw_turns = sess
         .turns
         .iter()
-        .find(|turn| turn.role == "user" && !turn.text.trim().is_empty())
-    {
+        .filter(|turn| !turn.text.trim().is_empty())
+        .count()
+        .min(IMPORT_RAW_SCROLLBACK_MAX_TURNS);
+    lines.push(format!(
+        "Visible raw scrollback retained in Envoy: latest {visible_raw_turns} text turns"
+    ));
+    let omitted_raw_turns = sess.turn_count.saturating_sub(visible_raw_turns);
+    if omitted_raw_turns > 0 {
+        lines.push(format!("Older raw scrollback omitted from Envoy DB: {omitted_raw_turns} turns"));
+    }
+
+    let first_user_text = sess.first_user_text.as_deref().or_else(|| {
+        sess.turns
+            .iter()
+            .find(|turn| turn.role == "user" && !turn.text.trim().is_empty())
+            .map(|turn| turn.text.as_str())
+    });
+    if let Some(first_user_text) = first_user_text {
         lines.push(String::new());
         lines.push("Original first request:".to_string());
-        lines.push(snippet(&first_user.text));
+        lines.push(snippet(first_user_text));
     }
 
     let mut recent: Vec<&ClaudeTurn> = sess
@@ -620,16 +665,16 @@ fn compact_session_turn(sess: &ClaudeSession) -> ClaudeTurn {
 
 fn import_turns_for_session(sess: &ClaudeSession) -> Vec<ClaudeTurn> {
     let mut turns = vec![compact_session_turn(sess)];
-    turns.extend(
-        sess.turns
-            .iter()
-            .filter(|turn| !turn.text.trim().is_empty())
-            .cloned()
-            .map(|mut turn| {
-                turn.history_only = true;
-                turn
-            }),
-    );
+    let raw: Vec<&ClaudeTurn> = sess
+        .turns
+        .iter()
+        .filter(|turn| !turn.text.trim().is_empty())
+        .collect();
+    let start = raw.len().saturating_sub(IMPORT_RAW_SCROLLBACK_MAX_TURNS);
+    turns.extend(raw.into_iter().skip(start).cloned().map(|mut turn| {
+        turn.history_only = true;
+        turn
+    }));
     turns
 }
 
@@ -1043,6 +1088,7 @@ pub fn claude_import(app: AppHandle, state: State<ImportState>, session_ids: Vec
                             "url": v.get("url").and_then(Value::as_str).unwrap_or(""),
                             "turns_written": v.get("turns_written").and_then(Value::as_i64).unwrap_or(0),
                             "original_turns": v.get("original_turns").and_then(Value::as_i64).unwrap_or(sess.turn_count as i64),
+                            "raw_omitted": v.get("raw_omitted").and_then(Value::as_i64).unwrap_or(0),
                             "compacted": v.get("compacted").and_then(Value::as_bool).unwrap_or(true),
                             "title": v.get("title").and_then(Value::as_str).unwrap_or(&title),
                         }),
@@ -1157,7 +1203,7 @@ pub fn open_session_in_app(app: AppHandle, url: String) -> Result<(), String> {
 
 /// Resume a batch of imported desktop sessions, then show the first one.
 #[tauri::command]
-pub fn open_sessions_in_app(app: AppHandle, urls: Vec<String>) -> Result<(), String> {
+pub fn open_sessions_in_app(app: AppHandle, urls: Vec<String>) -> Result<OpenImportedSessionsResult, String> {
     if urls.is_empty() {
         return Err("No imported sessions to open".to_string());
     }
@@ -1180,7 +1226,16 @@ pub fn open_sessions_in_app(app: AppHandle, urls: Vec<String>) -> Result<(), Str
         w.navigate(parsed).map_err(|e| e.to_string())?;
         let _ = w.show();
         let _ = w.set_focus();
-        Ok(())
+        let first_url = urls[0].clone();
+        let resumed = urls.len();
+        let app_for_close = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(350));
+            if let Some(import_window) = app_for_close.get_webview_window("import") {
+                let _ = import_window.close();
+            }
+        });
+        Ok(OpenImportedSessionsResult { resumed, first_url })
     } else {
         Err("Envoy window not open — sign in first".into())
     }
@@ -1240,6 +1295,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_streams_large_history_into_recent_window() {
+        let root = temp_projects_root("stream-cap");
+        let project = "-Users-pulkitnagpal-Desktop-speakx-zivon-v2";
+        let project_dir = root.join(project);
+        fs::create_dir_all(&project_dir).expect("project dir");
+        let path = project_dir.join("large-session.jsonl");
+        let total = IMPORT_RAW_SCROLLBACK_MAX_TURNS + 5;
+        let mut content = String::new();
+        for i in 0..total {
+            let line = json!({
+                "type": "user",
+                "timestamp": format!("2026-06-22T04:{:02}:00Z", i % 60),
+                "cwd": decode_project_dir(project),
+                "message": {
+                    "role": "user",
+                    "content": format!("prompt {i}"),
+                },
+            });
+            content.push_str(&format!("{line}\n"));
+        }
+        fs::write(&path, content).expect("large jsonl session");
+
+        let parsed = parse_session(&path).expect("parsed session");
+
+        assert_eq!(parsed.turn_count, total);
+        assert_eq!(parsed.turns.len(), IMPORT_RAW_SCROLLBACK_MAX_TURNS);
+        assert_eq!(parsed.first_user_text.as_deref(), Some("prompt 0"));
+        assert_eq!(parsed.turns[0].text, "prompt 5");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn compact_session_turn_creates_single_handoff_with_original_context() {
         let session = ClaudeSession {
             session_id: "claude-123".to_string(),
@@ -1251,35 +1338,36 @@ mod tests {
             turn_count: 4,
             preview: "build cowork import".to_string(),
             path: "/tmp/claude-123.jsonl".to_string(),
+            first_user_text: Some("Build the Cowork-style import flow.".to_string()),
             turns: vec![
-	                ClaudeTurn {
-	                    role: "user".to_string(),
-	                    text: "Build the Cowork-style import flow.".to_string(),
-	                    blocks: json!([]),
-	                    ts: None,
-	                    history_only: false,
-	                },
-	                ClaudeTurn {
-	                    role: "assistant".to_string(),
-	                    text: "I inspected the importer and found every session selected by default.".to_string(),
-	                    blocks: json!([{ "kind": "text", "text": "I inspected the importer." }]),
-	                    ts: None,
-	                    history_only: false,
-	                },
-	                ClaudeTurn {
-	                    role: "user".to_string(),
-	                    text: "Make it production-like and avoid huge histories.".to_string(),
-	                    blocks: json!([]),
-	                    ts: None,
-	                    history_only: false,
-	                },
-	                ClaudeTurn {
-	                    role: "assistant".to_string(),
-	                    text: "I will compact the imported transcript into a handoff.".to_string(),
-	                    blocks: json!([]),
-	                    ts: None,
-	                    history_only: false,
-	                },
+                ClaudeTurn {
+                    role: "user".to_string(),
+                    text: "Build the Cowork-style import flow.".to_string(),
+                    blocks: json!([]),
+                    ts: None,
+                    history_only: false,
+                },
+                ClaudeTurn {
+                    role: "assistant".to_string(),
+                    text: "I inspected the importer and found every session selected by default.".to_string(),
+                    blocks: json!([{ "kind": "text", "text": "I inspected the importer." }]),
+                    ts: None,
+                    history_only: false,
+                },
+                ClaudeTurn {
+                    role: "user".to_string(),
+                    text: "Make it production-like and avoid huge histories.".to_string(),
+                    blocks: json!([]),
+                    ts: None,
+                    history_only: false,
+                },
+                ClaudeTurn {
+                    role: "assistant".to_string(),
+                    text: "I will compact the imported transcript into a handoff.".to_string(),
+                    blocks: json!([]),
+                    ts: None,
+                    history_only: false,
+                },
             ],
         };
 
@@ -1290,19 +1378,20 @@ mod tests {
         assert!(turn.text.contains("Original turns: 4"));
         assert!(turn.text.contains("Build the Cowork-style import flow."));
         assert!(turn.text.len() <= IMPORT_COMPACTION_MAX_CHARS + 3);
-	}
+    }
 
-	#[test]
-	fn import_turns_include_handoff_plus_full_history_scrollback() {
-	    let turns: Vec<ClaudeTurn> = (0..15)
-	        .map(|i| ClaudeTurn {
-	            role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
-	            text: format!("turn-{i}"),
-	            blocks: json!([]),
-	            ts: None,
-	            history_only: false,
-	        })
-	        .collect();
+    #[test]
+    fn import_turns_include_handoff_plus_capped_recent_history_scrollback() {
+        let total = IMPORT_RAW_SCROLLBACK_MAX_TURNS + 5;
+        let turns: Vec<ClaudeTurn> = (0..total)
+            .map(|i| ClaudeTurn {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                text: format!("turn-{i}"),
+                blocks: json!([]),
+                ts: None,
+                history_only: false,
+            })
+            .collect();
         let session = ClaudeSession {
             session_id: "claude-456".to_string(),
             project: "/tmp/project".to_string(),
@@ -1313,18 +1402,23 @@ mod tests {
             turn_count: turns.len(),
             preview: "turn-0".to_string(),
             path: "/tmp/claude-456.jsonl".to_string(),
+            first_user_text: Some("turn-0".to_string()),
             turns,
         };
 
-	    let import_turns = import_turns_for_session(&session);
+        let import_turns = import_turns_for_session(&session);
 
-	    assert_eq!(import_turns.len(), 16);
-	    assert!(import_turns[0].text.contains("Imported Claude Code handoff"));
-	    assert!(!import_turns[0].history_only);
-	    assert_eq!(import_turns[1].text, "turn-0");
-	    assert_eq!(import_turns[15].text, "turn-14");
-	    assert!(import_turns[1..].iter().all(|turn| turn.history_only));
-	}
+        assert_eq!(import_turns.len(), IMPORT_RAW_SCROLLBACK_MAX_TURNS + 1);
+        assert!(import_turns[0].text.contains("Imported Claude Code handoff"));
+        assert!(!import_turns[0].history_only);
+        assert_eq!(import_turns[1].text, "turn-5");
+        let expected_last = format!("turn-{}", total - 1);
+        assert_eq!(
+            import_turns.last().map(|turn| turn.text.as_str()),
+            Some(expected_last.as_str())
+        );
+        assert!(import_turns[1..].iter().all(|turn| turn.history_only));
+    }
 
     #[test]
     fn import_title_uses_conversation_topic_not_project_folder() {
@@ -1338,6 +1432,7 @@ mod tests {
             turn_count: 1,
             preview: "Fix Claude import auto resume in desktop worker".to_string(),
             path: "/tmp/claude-a.jsonl".to_string(),
+            first_user_text: None,
             turns: vec![],
         };
 
