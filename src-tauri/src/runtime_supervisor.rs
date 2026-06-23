@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,13 +12,16 @@ use std::os::unix::process::CommandExt;
 
 use serde_json::{json, Value};
 use tauri::AppHandle;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{connect, Message, WebSocket};
 
 use crate::{KEYRING_SERVICE, KEYRING_SESSION};
 
 const KEYRING_RUNTIME_DEVICE: &str = "runtime_device_id";
 const GATEWAY_URL: &str = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_SECONDS: u64 = 5;
-const STREAM_FRAME_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
+const STREAM_FRAME_FLUSH_INTERVAL: Duration = Duration::from_millis(33);
 const STREAM_FRAME_FLUSH_BYTES: usize = 1024;
 
 #[derive(Clone, Debug)]
@@ -128,6 +131,39 @@ impl RuntimeStreamFrameCoalescer {
             .take()
             .map(|pending| vec![pending.frame])
             .unwrap_or_default()
+    }
+}
+
+struct RuntimeTurnEventStream {
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+}
+
+impl RuntimeTurnEventStream {
+    fn connect(identity: &SupervisorIdentity, turn: &RuntimeTurn) -> Result<Self, String> {
+        let url = runtime_turn_stream_url(GATEWAY_URL, identity, turn);
+        let mut request = url
+            .into_client_request()
+            .map_err(|e| format!("runtime turn stream request: {e}"))?;
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", identity.token)
+                .parse()
+                .map_err(|e| format!("runtime turn stream auth header: {e}"))?,
+        );
+        let (socket, _) = connect(request).map_err(|e| format!("runtime turn stream connect: {e}"))?;
+        Ok(Self { socket })
+    }
+
+    fn send_frame(&mut self, frame: &Value) -> Result<(), String> {
+        self.socket
+            .send(Message::Text(frame.to_string()))
+            .map_err(|e| format!("runtime turn stream send: {e}"))
+    }
+}
+
+impl Drop for RuntimeTurnEventStream {
+    fn drop(&mut self) {
+        let _ = self.socket.close(None);
     }
 }
 
@@ -1193,13 +1229,14 @@ fn process_runtime_turn(identity: &SupervisorIdentity, port: u16, turn: &Runtime
         urlencoding::encode(&thread_id)
     );
     let body = build_envoy2_turn_body(identity, turn);
+    let mut event_stream = RuntimeTurnEventStream::connect(identity, turn)?;
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_json(Value::Object(body));
 
     match resp {
         Ok(r) => {
-            let result = relay_envoy2_sse(identity, turn, r)?;
+            let result = relay_envoy2_sse(&mut event_stream, r)?;
             complete_runtime_turn(identity, turn, &result)
         }
         Err(ureq::Error::Status(code, r)) => {
@@ -1280,9 +1317,27 @@ fn append_stream_frame_content(frame: &mut Value, content: &str) {
     obj.insert("content".to_string(), Value::String(next));
 }
 
+fn runtime_turn_stream_url(base_url: &str, identity: &SupervisorIdentity, turn: &RuntimeTurn) -> String {
+    let base = base_url.trim_end_matches('/');
+    let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        base.to_string()
+    };
+    format!(
+        "{}/api/core/api/orgs/{}/runtime/turns/{}/stream?session_id={}&run_id={}",
+        ws_base,
+        urlencoding::encode(&identity.slug),
+        urlencoding::encode(&turn.turn_id),
+        urlencoding::encode(&turn.session_id),
+        urlencoding::encode(&turn.run_id),
+    )
+}
+
 fn relay_envoy2_sse(
-    identity: &SupervisorIdentity,
-    turn: &RuntimeTurn,
+    event_stream: &mut RuntimeTurnEventStream,
     response: ureq::Response,
 ) -> Result<RuntimeTurnResult, String> {
     let mut reader = BufReader::new(response.into_reader());
@@ -1317,7 +1372,7 @@ fn relay_envoy2_sse(
             .map_err(|e| format!("decode local envoy2 SSE frame: {e}: {raw}"))?;
         apply_runtime_frame(&mut result, &frame);
         for outbound in coalescer.ingest(frame.clone(), Instant::now()) {
-            post_runtime_turn_event(identity, turn, &outbound)?;
+            event_stream.send_frame(&outbound)?;
         }
         if frame.get("type").and_then(Value::as_str) == Some("done") || !result.error.is_empty() {
             break;
@@ -1325,7 +1380,7 @@ fn relay_envoy2_sse(
     }
 
     for outbound in coalescer.flush() {
-        post_runtime_turn_event(identity, turn, &outbound)?;
+        event_stream.send_frame(&outbound)?;
     }
 
     Ok(result)
@@ -1368,23 +1423,6 @@ fn apply_runtime_frame(result: &mut RuntimeTurnResult, frame: &Value) {
         }
         _ => {}
     }
-}
-
-fn post_runtime_turn_event(identity: &SupervisorIdentity, turn: &RuntimeTurn, frame: &Value) -> Result<(), String> {
-    let url = format!(
-        "{GATEWAY_URL}/api/core/api/orgs/{}/runtime/turns/{}/events",
-        urlencoding::encode(&identity.slug),
-        urlencoding::encode(&turn.turn_id)
-    );
-    post_runtime_json_empty_ok(
-        &url,
-        &identity.token,
-        json!({
-            "session_id": turn.session_id,
-            "run_id": turn.run_id,
-            "frame": frame,
-        }),
-    )
 }
 
 fn complete_runtime_turn(
@@ -1882,6 +1920,32 @@ mod tests {
         );
 
         assert_eq!(out, vec![json!({"type":"text","content":"firstsecond"})]);
+    }
+
+    #[test]
+    fn runtime_turn_stream_url_uses_websocket_scheme_and_encodes_identifiers() {
+        let identity = SupervisorIdentity {
+            token: "token".to_string(),
+            refresh_token: "refresh".to_string(),
+            slug: "acme org".to_string(),
+            bundle_json: "{}".to_string(),
+        };
+        let turn = RuntimeTurn {
+            turn_id: "turn 1".to_string(),
+            session_id: "sess/1".to_string(),
+            run_id: "run 1".to_string(),
+            content: String::new(),
+            conversation_history: vec![],
+            attachments: vec![],
+            extras: vec![],
+        };
+
+        let url = runtime_turn_stream_url("https://gateway.example.com", &identity, &turn);
+
+        assert_eq!(
+            url,
+            "wss://gateway.example.com/api/core/api/orgs/acme%20org/runtime/turns/turn%201/stream?session_id=sess%2F1&run_id=run%201"
+        );
     }
 
     #[test]
