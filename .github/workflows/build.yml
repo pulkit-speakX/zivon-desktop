@@ -1,0 +1,29 @@
+name: Desktop CI
+
+on:
+  pull_request:
+    branches: [envoy-cowork, main]
+  push:
+    branches: [envoy-cowork]
+
+jobs:
+  build:
+    name: Build & test (unsigned)
+    runs-on: macos-latest   # GitHub-hosted; never the self-hosted app-builder fleet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install JS deps
+        run: yarn install --frozen-lockfile
+      - name: Cargo test
+        working-directory: src-tauri
+        run: cargo test
+      - name: Test latest.json generator
+        run: node --test scripts/make-latest-json.test.mjs
+      - name: Unsigned tauri build (smoke)
+        run: yarn tauri build --target universal-apple-darwin --bundles app
