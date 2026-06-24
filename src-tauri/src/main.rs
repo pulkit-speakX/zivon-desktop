@@ -40,10 +40,13 @@ mod updater;
 const KEYRING_SERVICE: &str = "ai.zivon.envoy.desktop";
 const KEYRING_SESSION: &str = "session";
 
-/// The one and only endpoint this app ever loads. Hard-locked — there is no
-/// in-app setting or env override. This is the Envoy web UI; the desktop app is
-/// an Envoy-only client by design.
-const ENVOY_URL: &str = "http://localhost:3000";
+/// The Envoy web UI endpoint. Resolved at compile time from `ZIVON_ENVOY_URL`
+/// (set by the release pipeline), defaulting to the local dev server. This is the
+/// groundwork for Phase 2's hosted production URL; dev builds are unchanged.
+const ENVOY_URL: &str = match option_env!("ZIVON_ENVOY_URL") {
+    Some(url) => url,
+    None => "http://localhost:3000",
+};
 const OPEN_EXTERNAL_PATH: &str = "/__envoy_desktop/open_external";
 /// The remote web UI navigates here (with `title` / `body` query params) to ask
 /// for a native notification — the web Notification API isn't reliable in the
