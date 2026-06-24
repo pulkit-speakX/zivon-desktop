@@ -14,8 +14,8 @@ DMG=$(ls "$BUNDLE"/dmg/*.dmg)
 TARGZ=$(ls "$BUNDLE"/macos/*.app.tar.gz)
 SIG="${TARGZ}.sig"
 
-DMG_NAME="Envoy_${VERSION}_universal.dmg"
-TARGZ_NAME="Envoy_${VERSION}.app.tar.gz"
+DMG_NAME="Zivon_${VERSION}_universal.dmg"
+TARGZ_NAME="Zivon_${VERSION}.app.tar.gz"
 
 echo "Uploading artifacts to s3://${DESKTOP_S3_BUCKET}/ ..."
 aws s3 cp "$DMG"    "s3://${DESKTOP_S3_BUCKET}/${DMG_NAME}"        --cache-control "public, max-age=31536000, immutable"

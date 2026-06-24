@@ -85,4 +85,4 @@ jobs:
         run: |
           curl -s -X POST "$SLACK_WEBHOOK" \
             -H 'Content-Type: application/json' \
-            -d "{\"text\":\"✅ Envoy desktop ${{ steps.ver.outputs.version }} published: https://downloads.zivon.ai/Envoy_${{ steps.ver.outputs.version }}_universal.dmg\"}"
+            -d "{\"text\":\"✅ Zivon desktop ${{ steps.ver.outputs.version }} published: https://downloads.zivon.ai/Zivon_${{ steps.ver.outputs.version }}_universal.dmg\"}"

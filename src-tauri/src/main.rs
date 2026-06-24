@@ -357,7 +357,7 @@ pub(crate) fn create_app_window(app: &AppHandle, bundle_json: String) -> tauri::
     // (those live behind the capability-scoped "import" window).
     let nav_app = app.clone();
     let win = WebviewWindowBuilder::new(app, APP, WebviewUrl::External(parsed))
-        .title("Envoy")
+        .title("Zivon")
         .inner_size(1200.0, 820.0)
         .min_inner_size(820.0, 600.0)
         // Warm Claude-dark canvas, so there is no white flash before the web UI
@@ -391,7 +391,7 @@ pub(crate) fn create_app_window(app: &AppHandle, bundle_json: String) -> tauri::
                     .and_then(|w| w.is_focused().ok())
                     .unwrap_or(false);
                 if !focused {
-                    let mut title = "Envoy".to_string();
+                    let mut title = "Zivon".to_string();
                     let mut body = String::new();
                     for (key, value) in url.query_pairs() {
                         match key.as_ref() {
@@ -420,8 +420,8 @@ pub(crate) fn create_app_window(app: &AppHandle, bundle_json: String) -> tauri::
     let _ = app
         .notification()
         .builder()
-        .title("Envoy")
-        .body("You're signed in. Press ⌥Space anytime to summon Envoy.")
+        .title("Zivon")
+        .body("You're signed in. Press ⌥Space anytime to summon Zivon.")
         .show();
 
     Ok(())
@@ -434,7 +434,7 @@ pub(crate) fn create_splash_window(app: &AppHandle) -> tauri::Result<()> {
         return Ok(());
     }
     WebviewWindowBuilder::new(app, SPLASH, WebviewUrl::App("splash.html".into()))
-        .title("Envoy")
+        .title("Zivon")
         .inner_size(480.0, 640.0)
         .min_inner_size(420.0, 560.0)
         .resizable(true)
@@ -591,7 +591,7 @@ fn cmd_start_login(app: AppHandle) -> Result<(), String> {
 fn cmd_notify_test(app: AppHandle) -> Result<(), String> {
     app.notification()
         .builder()
-        .title("Envoy")
+        .title("Zivon")
         .body("Notifications are working.")
         .show()
         .map_err(|e| e.to_string())
@@ -662,17 +662,17 @@ fn main() {
             updater::check_and_notify(&handle, false);
 
             // --- Tray / menubar ---
-            let show_i = MenuItem::with_id(app, "show", "Show Envoy", true, None::<&str>)?;
+            let show_i = MenuItem::with_id(app, "show", "Show Zivon", true, None::<&str>)?;
             let import_i =
                 MenuItem::with_id(app, "import_sessions", "Import Claude Sessions…", true, None::<&str>)?;
             let update_i =
                 MenuItem::with_id(app, "check_updates", "Check for Updates…", true, None::<&str>)?;
             let signout_i = MenuItem::with_id(app, "signout", "Sign Out", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit Envoy", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit Zivon", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &import_i, &update_i, &signout_i, &quit_i])?;
 
             let mut tray = TrayIconBuilder::with_id("main")
-                .tooltip("Envoy")
+                .tooltip("Zivon")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -725,7 +725,7 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running Envoy desktop");
+        .expect("error while running Zivon desktop");
 }
 
 #[cfg(test)]

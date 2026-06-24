@@ -1,4 +1,4 @@
-# Releasing Envoy Desktop
+# Releasing Zivon Desktop
 
 This runbook covers cutting a release, version bumping, one-time DevOps setup, updater key rotation, and dry-run validation for the Envoy desktop app (`ai.zivon.envoy.desktop`).
 
@@ -84,7 +84,7 @@ The release pipeline requires infrastructure and credentials that must be set up
 
 2. **Create a dedicated app-specific password** for notarization.
    - Go to [appleid.apple.com](https://appleid.apple.com) → Security → App-Specific Passwords.
-   - Create a new password labeled `"Envoy Desktop Notarization"`.
+   - Create a new password labeled `"Zivon Desktop Notarization"`.
    - This password is for the *same* Apple ID as the cert, but is specific to desktop and never shared with iOS.
 
 ### 3.2 AWS Storage & CDN
@@ -218,12 +218,12 @@ Before shipping the first production release, validate the entire pipeline with 
    - ✅ CloudFront invalidation succeeds
    - ✅ Slack notification posted
 
-3. **Download the `.dmg`** from the Slack notification or from `https://downloads.zivon.ai/Envoy_0.1.1-rc.1_universal.dmg`.
+3. **Download the `.dmg`** from the Slack notification or from `https://downloads.zivon.ai/Zivon_0.1.1-rc.1_universal.dmg`.
 
 4. **Install on a clean Mac** (no development environment, no local repo, no Gatekeeper issues).
-   - Double-click the `.dmg` and drag Envoy to Applications.
+   - Double-click the `.dmg` and drag Zivon to Applications.
    - Confirm no Gatekeeper warning (it should open with no friction).
-   - Launch Envoy and confirm it runs (assuming Phase 1: it connects to a gateway / localhost).
+   - Launch Zivon and confirm it runs (assuming Phase 1: it connects to a gateway / localhost).
 
 ### Step 2: Test Auto-Update (RC2)
 
@@ -236,7 +236,7 @@ Before shipping the first production release, validate the entire pipeline with 
 2. **RC1 should detect the update:**
    - Within ~6 hours, the app's background updater will call `check()` and see RC2 is available.
    - Or, from the tray menu, click "Check for Updates…" to trigger immediately.
-   - A native prompt appears: *"Envoy 0.1.1-rc.2 is available. Install?"*
+   - A native prompt appears: *"Zivon 0.1.1-rc.2 is available. Install?"*
 
 3. **Confirm the prompt** and installation:
    - Click "Install" → the app downloads the new bundle and relaunches as RC2.

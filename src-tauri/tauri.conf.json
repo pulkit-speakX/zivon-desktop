@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Envoy",
+  "productName": "Zivon",
   "version": "0.1.0",
   "identifier": "ai.zivon.envoy.desktop",
   "build": {
@@ -26,8 +26,8 @@
     "targets": ["dmg", "app"],
     "createUpdaterArtifacts": true,
     "category": "Productivity",
-    "shortDescription": "Envoy desktop companion",
-    "longDescription": "Desktop companion for Envoy — hosts the Envoy web UI in a native window with menubar presence, a global hotkey, and system-browser sign-in.",
+    "shortDescription": "Zivon desktop companion",
+    "longDescription": "Desktop companion for Zivon — hosts the Zivon web UI in a native window with menubar presence, a global hotkey, and system-browser sign-in.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
