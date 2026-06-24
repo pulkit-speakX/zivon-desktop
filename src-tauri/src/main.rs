@@ -29,7 +29,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
-use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_opener::OpenerExt;
 
 mod desktop_bridge;
@@ -44,6 +44,10 @@ const KEYRING_SESSION: &str = "session";
 /// an Envoy-only client by design.
 const ENVOY_URL: &str = "http://localhost:3000";
 const OPEN_EXTERNAL_PATH: &str = "/__envoy_desktop/open_external";
+/// The remote web UI navigates here (with `title` / `body` query params) to ask
+/// for a native notification — the web Notification API isn't reliable in the
+/// WKWebView. We intercept, fire the OS notification, and cancel the nav.
+const NOTIFY_PATH: &str = "/__envoy_desktop/notify";
 const AUTH_SYNC_PATH: &str = "/auth/sync";
 const AUTH_SYNC_TOKEN_HEADER: &str = "X-Envoy-Desktop-Auth-Token";
 
@@ -370,6 +374,35 @@ pub(crate) fn create_app_window(app: &AppHandle, bundle_json: String) -> tauri::
                 }
                 return false;
             }
+            if url.path() == NOTIFY_PATH {
+                // Suppress only when the user is already looking at the chat.
+                // Use the authoritative *native* window-focus state — the web
+                // UI can't gate on this reliably from inside the WKWebView.
+                // is_focused() is false when the window is minimized, hidden,
+                // or another app is frontmost, which is exactly when we want to
+                // notify. Default to "not focused" (notify) if focus is unknown.
+                let focused = nav_app
+                    .get_webview_window(APP)
+                    .and_then(|w| w.is_focused().ok())
+                    .unwrap_or(false);
+                if !focused {
+                    let mut title = "Envoy".to_string();
+                    let mut body = String::new();
+                    for (key, value) in url.query_pairs() {
+                        match key.as_ref() {
+                            "title" if !value.is_empty() => title = value.into_owned(),
+                            "body" => body = value.into_owned(),
+                            _ => {}
+                        }
+                    }
+                    let mut builder = nav_app.notification().builder().title(title);
+                    if !body.is_empty() {
+                        builder = builder.body(body);
+                    }
+                    let _ = builder.show();
+                }
+                return false; // cancel — don't actually navigate
+            }
             true
         })
         .build()?;
@@ -587,6 +620,14 @@ fn main() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Request notification permission up front so the first real
+            // notification (e.g. a clarify question while the user is in another
+            // app) isn't silently dropped by macOS. No-op once granted.
+            if !matches!(handle.notification().permission_state(), Ok(PermissionState::Granted)) {
+                let _ = handle.notification().request_permission();
+            }
+
             let bridge = app.state::<desktop_bridge::DesktopBridgeState>().inner().clone();
             desktop_bridge::start_bridge(bridge)?;
             runtime_supervisor::start_runtime_supervisor(handle.clone());
