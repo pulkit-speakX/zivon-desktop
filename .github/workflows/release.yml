@@ -1,0 +1,80 @@
+name: Desktop Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.1-rc.1)"
+        required: true
+
+jobs:
+  release:
+    name: Build, sign, notarize & publish
+    runs-on: macos-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      DESKTOP_S3_BUCKET: ${{ secrets.DESKTOP_S3_BUCKET }}
+      DESKTOP_CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.DESKTOP_CLOUDFRONT_DISTRIBUTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          RAW="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$RAW" >> "$GITHUB_OUTPUT"
+          echo "version=${RAW#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: yarn install --frozen-lockfile
+
+      - name: Set version from tag
+        run: node scripts/set-version.mjs "${{ steps.ver.outputs.tag }}"
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PWD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > cert.p12
+          security import cert.p12 -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN"
+          rm -f cert.p12
+
+      - name: Build, sign & notarize
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          ZIVON_ENVOY_URL: ${{ vars.ZIVON_ENVOY_URL }}
+        run: yarn tauri build --target universal-apple-darwin --bundles dmg,app
+
+      - name: Publish to S3 + invalidate CloudFront
+        env:
+          RELEASE_NOTES: "Release ${{ steps.ver.outputs.version }}"
+        run: ./scripts/publish-s3.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Notify Slack
+        if: success()
+        run: |
+          curl -s -X POST "${{ secrets.DESKTOP_SLACK_WEBHOOK_URL }}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\":\"✅ Envoy desktop ${{ steps.ver.outputs.version }} published: https://downloads.zivon.ai/Envoy_${{ steps.ver.outputs.version }}_universal.dmg\"}"
