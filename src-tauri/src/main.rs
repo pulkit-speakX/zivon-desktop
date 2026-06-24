@@ -602,6 +602,26 @@ fn cmd_notify_test(app: AppHandle) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // macOS: disable inline predictive text / continuous spell checking for
+    // this app BEFORE the WKWebView is created. The candidate service
+    // otherwise floods the log with
+    // "NSSpellServer ... dataFromGeneratingCandidatesForSelectedRange timed out"
+    // on every focused text field (a Sonoma+ inline-prediction behavior that the
+    // HTML `spellcheck` attribute does not fully control). Written to the app's
+    // own defaults domain (best-effort), so it also persists across launches.
+    #[cfg(target_os = "macos")]
+    {
+        for key in [
+            "NSAutomaticInlinePredictionEnabled",
+            "WebContinuousSpellCheckingEnabled",
+            "WebAutomaticSpellingCorrectionEnabled",
+        ] {
+            let _ = std::process::Command::new("defaults")
+                .args(["write", "ai.zivon.envoy.desktop", key, "-bool", "false"])
+                .status();
+        }
+    }
+
     let auth_sync = start_auth_sync_server().expect("could not start desktop auth sync listener");
     tauri::Builder::default()
         // Focus the existing window if a second instance is launched.
