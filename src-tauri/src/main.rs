@@ -35,6 +35,7 @@ use tauri_plugin_opener::OpenerExt;
 mod desktop_bridge;
 mod import;
 mod runtime_supervisor;
+mod updater;
 
 const KEYRING_SERVICE: &str = "ai.zivon.envoy.desktop";
 const KEYRING_SESSION: &str = "session";
@@ -108,8 +109,9 @@ fn build_inject_script(bundle_json: &str, auth_sync: &DesktopAuthSyncConfig) -> 
     //    NOTE: this build hosts the WHOLE Zivon app — we keep the desktop flag
     //    (for the Claude skin) but no longer hide "Back to Zivon" or otherwise
     //    restrict navigation. The full app (dashboard, admin, etc.) is reachable.
-    let shell = r#"window.__ENVOY_DESKTOP__=true;try{document.documentElement.classList.add('envoy-desktop');}catch(e){}
+    let shell = r#"window.__ENVOY_DESKTOP__=true;window.__ENVOY_DESKTOP_VERSION__="__ENVOY_VERSION__";try{document.documentElement.classList.add('envoy-desktop');}catch(e){}
 try{window.localStorage.setItem('theme','claude-desktop');}catch(e){}"#;
+    let shell = shell.replace("__ENVOY_VERSION__", env!("CARGO_PKG_VERSION"));
     let sync_url =
         serde_json::to_string(&auth_sync.url).unwrap_or_else(|_| "\"\"".to_string());
     let sync_token =
@@ -604,6 +606,8 @@ fn main() {
             show_main(app);
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .manage(Mutex::new(())) // reserved for future shared state
         .manage(auth_sync)
@@ -631,14 +635,18 @@ fn main() {
             let bridge = app.state::<desktop_bridge::DesktopBridgeState>().inner().clone();
             desktop_bridge::start_bridge(bridge)?;
             runtime_supervisor::start_runtime_supervisor(handle.clone());
+            // Check for updates on launch (silent unless an update is found).
+            updater::check_and_notify(&handle, false);
 
             // --- Tray / menubar ---
             let show_i = MenuItem::with_id(app, "show", "Show Envoy", true, None::<&str>)?;
             let import_i =
                 MenuItem::with_id(app, "import_sessions", "Import Claude Sessions…", true, None::<&str>)?;
+            let update_i =
+                MenuItem::with_id(app, "check_updates", "Check for Updates…", true, None::<&str>)?;
             let signout_i = MenuItem::with_id(app, "signout", "Sign Out", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit Envoy", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_i, &import_i, &signout_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&show_i, &import_i, &update_i, &signout_i, &quit_i])?;
 
             let mut tray = TrayIconBuilder::with_id("main")
                 .tooltip("Envoy")
@@ -649,6 +657,7 @@ fn main() {
                     "import_sessions" => {
                         let _ = import::open_import_window(app);
                     }
+                    "check_updates" => updater::check_and_notify(app, true),
                     "signout" => {
                         let _ = sign_out(app);
                     }
@@ -778,6 +787,18 @@ mod tests {
         assert!(script.contains("k==='zivon_token'||k==='zivon_refresh_token'"));
         assert!(script.contains("__ENVOY_DESKTOP_AUTH_SYNC__"));
         assert!(script.contains("/auth/sync"));
+    }
+
+    #[test]
+    fn injection_script_exposes_desktop_version() {
+        let auth_sync = DesktopAuthSyncConfig {
+            url: "http://127.0.0.1:12345/auth/sync".to_string(),
+            token: "sync-secret".to_string(),
+            sync_count: Arc::new(AtomicU64::new(0)),
+        };
+        let script = build_inject_script(r#"{"zivon_token":"a","zivon_refresh_token":"b"}"#, &auth_sync);
+        assert!(script.contains("window.__ENVOY_DESKTOP_VERSION__="));
+        assert!(script.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
