@@ -9,6 +9,9 @@ on:
         description: "Tag to build (e.g. v0.1.1-rc.1)"
         required: true
 
+permissions:
+  contents: read
+
 jobs:
   release:
     name: Build, sign, notarize & publish
@@ -24,8 +27,11 @@ jobs:
 
       - name: Resolve version
         id: ver
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          RAW="${{ github.event.inputs.tag || github.ref_name }}"
+          RAW="${INPUT_TAG:-$REF_NAME}"
           echo "tag=$RAW" >> "$GITHUB_OUTPUT"
           echo "version=${RAW#v}" >> "$GITHUB_OUTPUT"
 
@@ -74,7 +80,9 @@ jobs:
 
       - name: Notify Slack
         if: success()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.DESKTOP_SLACK_WEBHOOK_URL }}
         run: |
-          curl -s -X POST "${{ secrets.DESKTOP_SLACK_WEBHOOK_URL }}" \
+          curl -s -X POST "$SLACK_WEBHOOK" \
             -H 'Content-Type: application/json' \
             -d "{\"text\":\"✅ Envoy desktop ${{ steps.ver.outputs.version }} published: https://downloads.zivon.ai/Envoy_${{ steps.ver.outputs.version }}_universal.dmg\"}"
