@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "updater",
+  "description": "Allows the trusted local shell (splash window) and the Rust core to check for and install signed app updates. The remote-content 'app' window is deliberately excluded.",
+  "windows": ["splash"],
+  "permissions": [
+    "updater:default",
+    "process:default"
+  ]
+}
