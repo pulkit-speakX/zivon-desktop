@@ -1224,9 +1224,11 @@ fn required_runtime_turn_string(value: &Value, key: &str) -> Result<String, Stri
 
 fn process_runtime_turn(identity: &SupervisorIdentity, port: u16, turn: &RuntimeTurn) -> Result<(), String> {
     let thread_id = format!("{}:{}", identity.slug, turn.session_id);
+    let endpoint = runtime_turn_endpoint(turn);
     let url = format!(
-        "http://127.0.0.1:{port}/v3/{}/stream",
-        urlencoding::encode(&thread_id)
+        "http://127.0.0.1:{port}/v3/{}/{}",
+        urlencoding::encode(&thread_id),
+        endpoint
     );
     let body = build_envoy2_turn_body(identity, turn);
     let mut event_stream = RuntimeTurnEventStream::connect(identity, turn)?;
@@ -1250,6 +1252,20 @@ fn process_runtime_turn(identity: &SupervisorIdentity, port: u16, turn: &Runtime
     }
 }
 
+fn runtime_turn_endpoint(turn: &RuntimeTurn) -> &'static str {
+    for extra in &turn.extras {
+        if extra
+            .get("runtime_action")
+            .and_then(Value::as_str)
+            .map(|action| action == "resume")
+            .unwrap_or(false)
+        {
+            return "resume";
+        }
+    }
+    "stream"
+}
+
 fn build_envoy2_turn_body(identity: &SupervisorIdentity, turn: &RuntimeTurn) -> serde_json::Map<String, Value> {
     let mut body = serde_json::Map::new();
     body.insert("content".to_string(), Value::String(turn.content.clone()));
@@ -1264,13 +1280,14 @@ fn build_envoy2_turn_body(identity: &SupervisorIdentity, turn: &RuntimeTurn) -> 
     for extra in &turn.extras {
         if let Some(obj) = extra.as_object() {
             for (key, value) in obj {
-                if matches!(key.as_str(), "content" | "user_email" | "org_slug" | "conversation_history") {
+                if matches!(key.as_str(), "content" | "user_email" | "org_slug" | "conversation_history" | "runtime_action") {
                     continue;
                 }
                 body.insert(key.clone(), value.clone());
             }
         }
     }
+    body.insert("execution_host".to_string(), Value::String("local".to_string()));
     body
 }
 
@@ -1966,7 +1983,8 @@ mod tests {
             extras: vec![json!({
                 "content": "malicious overwrite",
                 "selected_model": "opus",
-                "desktop_access_enabled": false
+                "desktop_access_enabled": false,
+                "execution_host": "cloud"
             })],
         };
 
@@ -1978,6 +1996,44 @@ mod tests {
         assert_eq!(
             body.get("desktop_access_enabled").and_then(Value::as_bool),
             Some(false)
+        );
+        assert_eq!(body.get("execution_host").and_then(Value::as_str), Some("local"));
+    }
+
+    #[test]
+    fn runtime_turn_endpoint_uses_resume_for_resume_action() {
+        let turn = RuntimeTurn {
+            turn_id: "turn-1".to_string(),
+            session_id: "sess-1".to_string(),
+            run_id: "run-1".to_string(),
+            content: String::new(),
+            conversation_history: vec![],
+            attachments: vec![],
+            extras: vec![json!({
+                "runtime_action": "resume",
+                "answers": [{"id": "approval_decision", "answer": "Approve"}]
+            })],
+        };
+
+        assert_eq!(runtime_turn_endpoint(&turn), "resume");
+        let body = build_envoy2_turn_body(
+            &SupervisorIdentity {
+                token: "token".to_string(),
+                refresh_token: "refresh".to_string(),
+                slug: "acme".to_string(),
+                bundle_json: r#"{"zivon_email":"pulkit@example.com"}"#.to_string(),
+            },
+            &turn,
+        );
+
+        assert!(body.get("runtime_action").is_none());
+        assert_eq!(
+            body.get("answers")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("answer"))
+                .and_then(Value::as_str),
+            Some("Approve")
         );
     }
 }
