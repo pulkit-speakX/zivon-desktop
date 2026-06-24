@@ -26,4 +26,4 @@ jobs:
       - name: Test latest.json generator
         run: node --test scripts/make-latest-json.test.mjs
       - name: Unsigned tauri build (smoke)
-        run: yarn tauri build --target universal-apple-darwin --bundles app
+        run: yarn tauri build --target universal-apple-darwin --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'

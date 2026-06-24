@@ -168,7 +168,7 @@ This prompts for a **password** to protect the private key. You must provide thi
 > ⚠️ **Current state:** The updater key has an **empty password** (private key at `~/.zivon/envoy-updater.key`). Before going to production, we recommend setting a password on the key. See the "migrate to a password-protected key" section below.
 
 Output:
-- Public key → copy to `tauri.conf.json` under `build.windows.sign[0].certificateFile` (or the macOS updater section).
+- Public key → copy to `tauri.conf.json` under `plugins.updater.pubkey`.
 - Private key → save for GitHub Secret entry (do not commit).
 
 ### Rotating the Key (when needed)
